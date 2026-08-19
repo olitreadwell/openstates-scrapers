@@ -78,3 +78,89 @@ class TestBaseCategorizer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuleEdgeCases(unittest.TestCase):
+    def test_flexible_whitespace_false_requires_exact_spacing(self):
+        rule = Rule(
+            "Referred to Committee", "referral-committee", flexible_whitespace=False
+        )
+        self.assertEqual(rule.match("Referred to Committee"), {})
+        self.assertIsNone(rule.match("Referred to   Committee"))
+
+    def test_flags_zero_makes_matching_case_sensitive(self):
+        rule = Rule("Passed Senate", "passage", flags=0)
+        self.assertEqual(rule.match("Passed Senate"), {})
+        self.assertIsNone(rule.match("passed senate"))
+
+    def test_compiled_regex_passes_through_untouched(self):
+        import re as re_module
+
+        compiled = re_module.compile(r"Passed Senate")
+        rule = Rule(compiled, "passage")
+        self.assertEqual(rule.match("Passed Senate"), {})
+
+    def test_sequence_of_regexes_matches_when_any_match(self):
+        rule = Rule(["Referred to Committee", "Passed Senate"], "passage")
+        self.assertEqual(rule.match("Referred to Committee"), {})
+        self.assertEqual(rule.match("Passed Senate"), {})
+
+    def test_stop_flag_is_stored_on_the_rule(self):
+        rule = Rule("Passed", "passage", True)
+        self.assertTrue(rule.stop)
+
+
+class UppercasingCategorizer(BaseCategorizer):
+    rules = [Rule("PASSED SENATE", "passage")]
+
+    def pre_categorize(self, text):
+        return text.upper()
+
+
+class PostHookCategorizer(BaseCategorizer):
+    rules = [Rule("Passed Senate", "passage")]
+
+    def post_categorize(self, return_val):
+        return_val["source"] = "test"
+        return return_val
+
+
+class ActorCategorizer(BaseCategorizer):
+    rules = [
+        Rule(r"Passed by (?P<actor>\w+)", "passage"),
+        Rule("Signed by Speaker", "passage", actor="lower"),
+    ]
+
+
+class TestBaseCategorizerHooks(unittest.TestCase):
+    def test_pre_categorize_hook_transforms_text_before_matching(self):
+        categorizer = UppercasingCategorizer()
+        result = categorizer.categorize("passed senate")
+        self.assertEqual(result["classification"], ["passage"])
+
+    def test_post_categorize_hook_can_add_attrs(self):
+        categorizer = PostHookCategorizer()
+        result = categorizer.categorize("Passed Senate")
+        self.assertEqual(result["source"], "test")
+
+    def test_actor_named_group_unwraps_to_string(self):
+        categorizer = ActorCategorizer()
+        result = categorizer.categorize("Passed by senate")
+        self.assertEqual(result["actor"], "senate")
+
+    def test_rule_attrs_are_merged_into_result(self):
+        categorizer = ActorCategorizer()
+        result = categorizer.categorize("Signed by Speaker")
+        self.assertEqual(result["actor"], "lower")
+
+    def test_multiple_rules_union_their_types(self):
+        class MultiRuleCategorizer(BaseCategorizer):
+            rules = [
+                Rule("Referred to Ways and Means", "referral-committee"),
+                Rule("Ways and Means", "committee"),
+            ]
+
+        result = MultiRuleCategorizer().categorize("Referred to Ways and Means")
+        self.assertEqual(
+            set(result["classification"]), {"referral-committee", "committee"}
+        )
