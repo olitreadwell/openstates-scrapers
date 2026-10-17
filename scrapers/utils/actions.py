@@ -40,6 +40,8 @@ class Rule(namedtuple("Rule", "regexes types stop attrs")):
             if isinstance(regex, str):
                 if flexible_whitespace:
                     c_regex = re.sub(r"\s{1,4}", r"\\s{,10}", regex)
+                else:
+                    c_regex = regex
                 compiled_regexes.append(re.compile(c_regex, flags))
             else:
                 compiled_regexes.append(regex)
