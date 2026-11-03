@@ -40,6 +40,10 @@ LOCAL_CALENDAR_BILL_REGEX = re.compile(
 
 NAY_NAMES_REGEX = re.compile(r"[\"“]Nay[\"”]\s+([^()\"“]+)")
 
+PASSAGE_MOTION_REGEX = re.compile(
+    r"(final )?passage|adoption|concur in the|adopt the conference committee report"
+)
+
 
 def next_tag(el):
     """
@@ -93,10 +97,19 @@ def clean_journal(root, logger):
 
 def names(el):
     text = (el.text or "") + (el.tail or "")
+    # drop the label, which can itself contain a comma ("Present, not voting —")
+    text = re.split(r"[\u2014:]", text, maxsplit=1)[-1]
     split_name_list = text.split(";")
     if len(split_name_list) < 7:
-        # probably failed to properly split on semi-colons; try commas:
-        split_name_list = text.split(",")
+        # probably failed to properly split on semi-colons; try commas.
+        # But TX names legitimately use a comma to disambiguate shared
+        # surnames, e.g. "Davis, A." or "Lopez, J." -- don't split those
+        # apart. Only skip a comma when it's immediately followed by a
+        # lone initial that ends the name (semicolon or end of string);
+        # if a capitalized word follows the initial instead (senate lists
+        # disambiguate with a *leading* initial, e.g. "Hancock, A.
+        # Hinojosa, J. Hinojosa, Huffman"), the comma is a real separator.
+        split_name_list = re.split(r",(?!\s*[A-Z]\.(?:;|$))", text)
 
     names = []
     for name in split_name_list:
@@ -112,7 +125,11 @@ def names(el):
             for n in names_still_with_semicolon:
                 n = n.strip().replace(".", "")
                 if " — " in n:
-                    n = n.split()[-1]
+                    # Take everything after the label (e.g. "Absent —"),
+                    # not just the last whitespace token -- a comma-initial
+                    # name like "Jones, V" has a space in it and would
+                    # otherwise get shredded down to just "V".
+                    n = n.split(" — ")[-1]
                 names.append(n)
         else:
             names.append(name)
@@ -120,8 +137,11 @@ def names(el):
     if names:
         # First item in the list will have stuff to ignore before an mdash
         names[0] = clean_starting_name(names[0]).strip()
-        # Get rid of trailing '.'
-        names[-1] = names[-1][0:-1]
+        # Get rid of trailing '.', if there is one -- don't blindly chop
+        # the last character, or a real trailing character (e.g. the "l"
+        # in "Virdell") gets truncated.
+        if names[-1].endswith("."):
+            names[-1] = names[-1][:-1]
 
     return names
 
@@ -142,14 +162,33 @@ def clean_starting_name(name):
     return re.split(r"[\u2014:]", name)[-1]
 
 
-def votes(root, session, chamber):
-    for vote in record_votes_with_yeas(root, session, chamber):
+def paragraph_key(el):
+    """A stable identity for a journal paragraph, used to make sure the
+    four vote scanners below (whose trigger conditions aren't mutually
+    exclusive -- e.g. a paragraph can contain both "yeas"-style text and
+    a trailing "(N - N - N)" tally) don't each turn the same paragraph
+    into its own VoteEvent. Keyed on the element's position in the
+    document, not its text -- journal boilerplate ("The bill was read
+    third time and was passed by the following vote: Yeas 31, Nays 0.")
+    repeats verbatim for different bills."""
+    return el.getroottree().getpath(el)
+
+
+def votes(root, session, chamber, speaker=None):
+    # Shared across all four scanners so a paragraph already claimed by
+    # an earlier one is skipped by the rest.
+    claimed_paragraphs = set()
+    for vote in record_votes_with_yeas(
+        root, session, chamber, claimed_paragraphs, speaker
+    ):
         yield vote
-    for vote in viva_voce_votes(root, session, chamber):
+    for vote in viva_voce_votes(root, session, chamber, claimed_paragraphs):
         yield vote
-    for vote in record_votes_with_short_count_notation(root, session, chamber):
+    for vote in record_votes_with_short_count_notation(
+        root, session, chamber, claimed_paragraphs
+    ):
         yield vote
-    for vote in local_calendar_votes(root, session, chamber):
+    for vote in local_calendar_votes(root, session, chamber, claimed_paragraphs):
         yield vote
 
 
@@ -158,11 +197,14 @@ def first_int(res):
         return int(next(group for group in res.groups() if group is not None))
 
 
-def identify_classification(motion_text: str, passed: bool) -> list[str]:
+def identify_classification(motion_text: str) -> list[str]:
+    motion = motion_text.lower()
     classifications = []
-    if passed is True:
+    if motion.startswith("adoption") and "amendment" in motion:
+        classifications.append("amendment")
+    elif PASSAGE_MOTION_REGEX.match(motion):
         classifications.append("passage")
-    if "third reading" in motion_text.lower():
+    if "third reading" in motion:
         classifications.append("reading-3")
 
     return classifications
@@ -231,11 +273,15 @@ class BaseVote(object):
 class MaybeVote(BaseVote):
     yeas_pattern = re.compile(r"yeas[\s\xa0]+(\d+)|(\d+)[\s\xa0]+yeas", re.IGNORECASE)
     nays_pattern = re.compile(r"nays[\s\xa0]+(\d+)|(\d+)[\s\xa0]+nays", re.IGNORECASE)
+    # House: "1 Present, not voting"; Senate: "Present-not voting 1"
     present_pattern = re.compile(
-        r"present[\s\xa0]+(\d+)|(\d+)[\s\xa0]+present", re.IGNORECASE
+        r"present(?:-not[\s\xa0]+voting)?[\s\xa0]+(\d+)|(\d+)[\s\xa0]+present",
+        re.IGNORECASE,
     )
     record_pattern = re.compile(r"\(record[\s\xa0]+(\d+)\)", re.IGNORECASE)
-    passed_pattern = re.compile(r"(adopted|passed|prevailed)", re.IGNORECASE)
+    result_pattern = re.compile(
+        r"\b(adopted|passed|prevailed|failed|lost)\b", re.IGNORECASE
+    )
     check_prev_pattern = re.compile(r"the (motion|resolution)", re.IGNORECASE)
     votes_pattern = re.compile(r"^(yeas|nays|present|absent)", re.IGNORECASE)
     amendment_pattern = re.compile(
@@ -277,9 +323,11 @@ class MaybeVote(BaseVote):
 
     @property
     def passed(self):
-        passed_match = self.passed_pattern.search(self.text)
-        if passed_match:
-            return bool(passed_match)
+        # the last result word is the vote's own result, e.g. "SJR 35 failed of
+        # adoption (not receiving the necessary two-thirds vote) by ..."
+        results = self.result_pattern.findall(self.text)
+        if results:
+            return results[-1].lower() not in ("failed", "lost")
         elif self.yeas > 0 or self.nays > 0:
             return self.yeas > self.nays
         else:
@@ -473,7 +521,7 @@ short_count_notation_regex = re.compile(
 )
 
 
-def record_votes_with_short_count_notation(root, session, chamber):
+def record_votes_with_short_count_notation(root, session, chamber, claimed_paragraphs):
     # votes with short vote count notation may look like:
     # SB 422 (Cook, Patterson, and Thimesch - no) (135 - 3 - 1)
     # or
@@ -495,6 +543,10 @@ def record_votes_with_short_count_notation(root, session, chamber):
         if not mv.is_valid:
             continue
 
+        key = paragraph_key(mv.el)
+        if key in claimed_paragraphs:
+            continue
+
         if mv.passed:
             motion_text = "passage"
         else:
@@ -505,11 +557,12 @@ def record_votes_with_short_count_notation(root, session, chamber):
             start_date=None,
             motion_text=motion_text,
             result="pass" if mv.passed else "fail",
-            classification=identify_classification(motion_text, mv.passed),
+            classification=identify_classification(motion_text),
             legislative_session=session,
             bill=mv.bill_id,
             bill_chamber=mv.chamber,
         )
+        claimed_paragraphs.add(key)
 
         v.set_count("yes", mv.counts["yeas"] or 0)
         v.set_count("no", mv.counts["nays"] or 0)
@@ -523,7 +576,7 @@ def record_votes_with_short_count_notation(root, session, chamber):
         yield v
 
 
-def local_calendar_votes(root, session, chamber):
+def local_calendar_votes(root, session, chamber, claimed_paragraphs):
     # The senate's Local & Uncontested Calendar lists each bill with a
     # terse per-bill vote entry in the journal, e.g.:
     #   SB 2474 (Hinojosa)
@@ -534,6 +587,10 @@ def local_calendar_votes(root, session, chamber):
     for el in root.xpath('//div[@class = "textpara"]'):
         text = " ".join(el.text_content().split())
         if not LOCAL_CALENDAR_VOTE_REGEX.match(text):
+            continue
+
+        key = paragraph_key(el)
+        if key in claimed_paragraphs:
             continue
 
         # The bill is the "SB 2474 (Author)" line a couple of elements
@@ -555,6 +612,7 @@ def local_calendar_votes(root, session, chamber):
         if bill_id is None:
             continue
         bill_chamber = {"H": "lower", "S": "upper"}.get(bill_id[0])
+        claimed_paragraphs.add(key)
 
         count_groups = LOCAL_CALENDAR_COUNTS_REGEX.findall(text)
         for i, (yeas, nays, trailing) in enumerate(count_groups):
@@ -570,7 +628,7 @@ def local_calendar_votes(root, session, chamber):
                 start_date=None,
                 motion_text=motion_text,
                 result="pass" if passed else "fail",
-                classification=identify_classification(motion_text, passed),
+                classification=identify_classification(motion_text),
                 legislative_session=session,
                 bill=bill_id,
                 bill_chamber=bill_chamber,
@@ -589,7 +647,7 @@ def local_calendar_votes(root, session, chamber):
             yield v
 
 
-def record_votes_with_yeas(root, session, chamber):
+def record_votes_with_yeas(root, session, chamber, claimed_paragraphs, speaker=None):
     # votes with "yeas" may look like:
     # SB 186 was passed by (Record 2040): 122 Yeas, 17 Nays, 1 Present, not voting.
     # or
@@ -608,57 +666,8 @@ def record_votes_with_yeas(root, session, chamber):
         if not mv.is_valid:
             continue
 
-        if mv.motion_text:
-            motion_text = mv.motion_text
-        elif mv.passed:
-            motion_text = "passage"
-        else:
-            motion_text = "other"
-
-        v = VoteEvent(
-            chamber=chamber,
-            start_date=None,
-            motion_text=motion_text,
-            result="pass" if mv.passed else "fail",
-            classification=identify_classification(motion_text, mv.passed),
-            legislative_session=session,
-            bill=mv.bill_id,
-            bill_chamber=mv.chamber,
-        )
-
-        v.set_count("yes", mv.yeas or 0)
-        v.set_count("no", mv.nays or 0)
-        v.set_count("not voting", mv.present or 0)
-
-        for each in mv.votes["yeas"]:
-            each = clean_vote_name(each)
-            v.yes(each)
-        for each in mv.votes["nays"]:
-            each = clean_vote_name(each)
-            v.no(each)
-        for each in mv.votes["present"]:
-            each = clean_vote_name(each)
-            v.vote("not voting", each)
-        for each in mv.votes["absent"]:
-            each = clean_vote_name(each)
-            v.vote("absent", each)
-
-        yield v
-
-
-def clean_vote_name(name):
-    # Removes extra text like Committee Meeting —  and Excused —
-    if " — " in name:
-        name = " ".join(name.split(" — ")[1:])
-    return name
-
-
-def viva_voce_votes(root, session, chamber):
-    vote_elements = root.xpath('//div[starts-with(., "All Members are deemed")]')
-    maybe_votes = [MaybeViva(el) for el in vote_elements]
-
-    for mv in maybe_votes:
-        if not mv.is_valid:
+        key = paragraph_key(mv.el)
+        if key in claimed_paragraphs:
             continue
 
         if mv.motion_text:
@@ -673,11 +682,106 @@ def viva_voce_votes(root, session, chamber):
             start_date=None,
             motion_text=motion_text,
             result="pass" if mv.passed else "fail",
-            classification=identify_classification(motion_text, mv.passed),
+            classification=identify_classification(motion_text),
             legislative_session=session,
             bill=mv.bill_id,
             bill_chamber=mv.chamber,
         )
+        claimed_paragraphs.add(key)
+
+        v.set_count("yes", mv.yeas or 0)
+        v.set_count("no", mv.nays or 0)
+        v.set_count("not voting", mv.present or 0)
+
+        v.set_count("absent", len(mv.votes["absent"]))
+
+        for each in mv.votes["yeas"]:
+            each = clean_vote_name(each, speaker)
+            v.yes(each)
+        for each in mv.votes["nays"]:
+            each = clean_vote_name(each, speaker)
+            v.no(each)
+        for each in mv.votes["present"]:
+            each = clean_vote_name(each, speaker)
+            v.vote("not voting", each)
+        for each in mv.votes["absent"]:
+            each = clean_vote_name(each, speaker)
+            v.vote("absent", each)
+
+        yield v
+
+
+def senate_roll_call(root):
+    # The day's opening roll call, e.g.
+    #   The roll was called and the following Senators were present: Alvarado, ...
+    #   Absent-excused: West.
+    roll_call = root.xpath(
+        '//div[@class = "textpara"][contains(., "following Senators were present")]'
+    )
+    if not roll_call:
+        return []
+    members = names(roll_call[0])
+    el = next_tag(roll_call[0])
+    while el is not None and (el.text or "").startswith("Absent"):
+        members.extend(names(el))
+        el = next_tag(el)
+    return members
+
+
+def fill_implied_yeas(vote, members):
+    # Senate journals name only the members who didn't vote yea; every
+    # other senator on the day's roll call voted yea
+    if any(v["option"] == "yes" for v in vote.votes):
+        return
+    yeas = next(c["value"] for c in vote.counts if c["option"] == "yes")
+    listed = {v["voter_name"] for v in vote.votes}
+    implied = [m for m in members if m not in listed]
+    if yeas and listed <= set(members) and len(implied) == yeas:
+        for name in implied:
+            vote.yes(name)
+
+
+def clean_vote_name(name, speaker=None):
+    # Removes extra text like Committee Meeting —  and Excused —
+    if " — " in name:
+        name = " ".join(name.split(" — ")[1:])
+    # "(C)" marks whoever is in the chair, usually "Mr. Speaker(C)"
+    name = name.replace("(C)", "")
+    if name in ("Mr. Speaker", "Mr Speaker"):
+        name = speaker or name
+    return name
+
+
+def viva_voce_votes(root, session, chamber, claimed_paragraphs):
+    vote_elements = root.xpath('//div[starts-with(., "All Members are deemed")]')
+    maybe_votes = [MaybeViva(el) for el in vote_elements]
+
+    for mv in maybe_votes:
+        if not mv.is_valid:
+            continue
+
+        key = paragraph_key(mv.el)
+        if key in claimed_paragraphs:
+            continue
+
+        if mv.motion_text:
+            motion_text = mv.motion_text
+        elif mv.passed:
+            motion_text = "passage"
+        else:
+            motion_text = "other"
+
+        v = VoteEvent(
+            chamber=chamber,
+            start_date=None,
+            motion_text=motion_text,
+            result="pass" if mv.passed else "fail",
+            classification=identify_classification(motion_text),
+            legislative_session=session,
+            bill=mv.bill_id,
+            bill_chamber=mv.chamber,
+        )
+        claimed_paragraphs.add(key)
 
         v.set_count("yes", 0)
         v.set_count("no", 0)
@@ -703,6 +807,7 @@ def get_journal_session_url_file_part(session, chamber):
 class TXVoteScraper(Scraper):
     def scrape(self, session=None, chamber=None, url_match=None):
         self._seen_vote_keys = set()
+        self._senate_members = []
 
         if session == "821":
             self.warning("no journals for session 821")
@@ -745,14 +850,14 @@ class TXVoteScraper(Scraper):
                 )
                 if url_match is None or url_match.lower() in journal_url.lower():
                     try:
-                        self.get(journal_url)
+                        resp = self.get(journal_url)
                     except scrapelib.HTTPError:
                         urls_failed_on_exception.append(journal_url)
                         pass
                     else:
                         urls_scraped.append(journal_url)
                         yield from self.scrape_journal(
-                            journal_url, "lower", session, session_url_part
+                            journal_url, resp.text, "lower", session, session_url_part
                         )
 
                 # Check if this "legislative day" has a Continuing journal entry
@@ -760,14 +865,18 @@ class TXVoteScraper(Scraper):
                 continuing_url = journal_url.replace("FINAL", "CFINAL")
                 if url_match is None or url_match.lower() in continuing_url.lower():
                     try:
-                        self.get(continuing_url)
+                        resp = self.get(continuing_url)
                     except scrapelib.HTTPError:
                         urls_failed_on_exception.append(continuing_url)
                         pass
                     else:
                         urls_scraped.append(continuing_url)
                         yield from self.scrape_journal(
-                            continuing_url, "lower", session, session_url_part
+                            continuing_url,
+                            resp.text,
+                            "lower",
+                            session,
+                            session_url_part,
                         )
 
             if "upper" in chambers:
@@ -782,14 +891,14 @@ class TXVoteScraper(Scraper):
                 )
                 if url_match is None or url_match.lower() in journal_url.lower():
                     try:
-                        self.get(journal_url)
+                        resp = self.get(journal_url)
                     except scrapelib.HTTPError:
                         urls_failed_on_exception.append(journal_url)
                         pass
                     else:
                         urls_scraped.append(journal_url)
                         yield from self.scrape_journal(
-                            journal_url, "upper", session, session_url_part
+                            journal_url, resp.text, "upper", session, session_url_part
                         )
 
                 # Check if this "legislative day" has a Continuing journal entry
@@ -797,14 +906,18 @@ class TXVoteScraper(Scraper):
                 continuing_url = journal_url.replace("F.", "F1.")
                 if url_match is None or url_match.lower() in continuing_url.lower():
                     try:
-                        self.get(continuing_url)
+                        resp = self.get(continuing_url)
                     except scrapelib.HTTPError:
                         urls_failed_on_exception.append(continuing_url)
                         pass
                     else:
                         urls_scraped.append(continuing_url)
                         yield from self.scrape_journal(
-                            continuing_url, "upper", session, session_url_part
+                            continuing_url,
+                            resp.text,
+                            "upper",
+                            session,
+                            session_url_part,
                         )
 
             journal_day += datetime.timedelta(days=1)
@@ -817,9 +930,7 @@ class TXVoteScraper(Scraper):
         self.logger.debug(f"Scraped urls: {urls_tried}")
         self.logger.debug(f"Failed urls: {urls_failed_on_exception}")
 
-    def scrape_journal(self, url, chamber, session, session_url_filename_part):
-        page = self.get(url).text
-
+    def scrape_journal(self, url, page, chamber, session, session_url_filename_part):
         root = lxml.html.fromstring(page)
         clean_journal(root, self.logger)
 
@@ -841,7 +952,12 @@ class TXVoteScraper(Scraper):
             )
             date = datetime.datetime.strptime(date_str, "%m-%d %Y").date()
 
-        for vote in votes(root, session, chamber):
+        if chamber == "upper":
+            # a day continued after recess has no roll call of its own
+            self._senate_members = senate_roll_call(root) or self._senate_members
+        for vote in votes(root, session, chamber, self.house_speaker(session)):
+            if chamber == "upper" and self._senate_members:
+                fill_implied_yeas(vote, self._senate_members)
             vote.start_date = date
             vote.add_source(url)
 
@@ -862,6 +978,8 @@ class TXVoteScraper(Scraper):
         counts = ",".join(
             "{}:{}".format(count["option"], count["value"])
             for count in sorted(vote.counts, key=lambda count: count["option"])
+            # a "(Same as previous roll call)" paragraph lists no absentees
+            if count["option"] != "absent"
         )
         return "#".join(
             [
@@ -871,6 +989,16 @@ class TXVoteScraper(Scraper):
                 vote.motion_text or "",
                 counts,
             ]
+        )
+
+    def house_speaker(self, session):
+        return next(
+            (
+                s.get("extras", {}).get("house_speaker")
+                for s in self.jurisdiction.legislative_sessions
+                if s["identifier"] in (session, session.strip("R"))
+            ),
+            None,
         )
 
     def get_session_start_date_string(self, session) -> str:

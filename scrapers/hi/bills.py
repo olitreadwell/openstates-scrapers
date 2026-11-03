@@ -1,9 +1,10 @@
 import datetime as dt
+import logging
 import lxml.html
 import re
 from openstates.scrape import Scraper, Bill, VoteEvent
 from .actions import Categorizer, find_committee
-from .utils import get_short_codes, make_data_url
+from .utils import get_members, get_short_codes, make_data_url
 from urllib import parse as urlparse
 import dateutil
 import pytz
@@ -14,6 +15,7 @@ SHORT_CODES = f"{HI_URL_BASE}/legislature/committees.aspx?chamber=all"
 TEST_SINGLE_BILL = False
 TEST_SINGLE_BILL_NUMBER = "572"  # set to bill num you want to test
 repeated_action = ["Excused: none", "Representative(s) Eli"]
+HOUSE_SEATS = 51
 
 vote_re_list = [
     r"""
@@ -21,24 +23,24 @@ vote_re_list = [
         (:\s+(?P<yes>.*?))?;\s+  # Yes members
         Aye\(?s\)?\swith\sreservations:\s+(?P<yes_resv>.*?);?
         (?P<n_no>\d*)\sNo\(?es\)?:\s+(?P<no>.*?);?
-        (\s+and\s+)?
-        (?P<n_excused>\d*)\sExcused:\s(?P<excused>.*)\.?
+        (\s+and)?\s*
+        (?P<n_excused>\d*)\s?Excused:\s(?P<excused>.*?)\.?$
         """,
     r"""
         Ayes,?\s(?P<n_yes>\d+)  # Capture number of Ayes
         (?:;\s*(?P<yes>[^.;]*))?  # Capture Yes members if present
         [.;]?\s*Aye\(s\)?\swith\sreservations:?\s(?P<yes_resv>[^.;]*)?  # Capture Ayes with reservations
         [.;]?\s*Noes?,?\s(?P<n_no>\d+)  # Capture number of Noes
-        (?:\s?\((?P<no>[^)]*)\))?  # Optional: Noes details in parentheses
+        (?:\s?\((?P<no>(?:[^()]|\([^)]*\))*)\))?  # Optional: Noes details in parentheses
         [.;]?\s*Excused,?\s(?P<n_excused>\d+)  # Capture number of Excused
-        (?:\s?\((?P<excused>[^)]*)\))?  # Optional: Excused details in parentheses
+        (?:\s?\((?P<excused>(?:[^()]|\([^)]*\))*)\))?  # Optional: Excused details in parentheses
         [.;]?  # Optional end punctuation
         """,
     r"""
     (?P<n_yes>\d+)\sAyes?:\s(?:Representative|Senator)\(s\)\s(?P<yes>.*?);
     \s*Ayes?\swith\sreservations:\s+(?P<yes_resv>.*?);
     \s*(?P<n_no>\d*)\sNoes?:\s(?:Representative\(s\)|Senator\(s\)|)\s?(?P<no>.*?);?
-    \s*and\s*(?P<n_excused>\d*)\sExcused:\s(?P<excused>.*)\.?
+    \s*and\s*(?P<n_excused>\d*)\sExcused:\s(?P<excused>.*?)\.?$
 """,
     r"""
     Passed.*?Reading.*?  # Match "Passed...Reading" including amendments
@@ -46,6 +48,12 @@ vote_re_list = [
     \s*Aye\(s\)?\swith\sreservations:?\s(?P<yes_resv>[^.;]*)[.;]?  # Capture Yes with reservations
     \s*Noes?,?\s(?P<n_no>\d+)\s?\(?([^)]*)\).*\)?\.? # Capture No votes
     \s*Excused,?\s(?P<n_excused>\d+)\s?\(?(?P<excused>[^)]*)\)?\.?  # Capture Excused votes
+""",
+    # House floor votes name only the exceptions and give no aye count
+    r"""
+    (?P<motion>^[^.]*?)\swith\s(?P<yes_resv>.*?)\svoting\saye\swith\sreservations;
+    \s*(?P<no>.*?)\svoting\sno\s\((?P<n_no>\d+)\)
+    \s*and\s*(?P<excused>.*?)\sexcused\s\((?P<n_excused>\d+)\)
 """,
 ]
 
@@ -68,6 +76,28 @@ def create_bill_report_url(chamber, year, bill_type):
     )
 
 
+logger = logging.getLogger(__name__)
+
+# A voter-name token that's really just a middle initial (e.g. "C." in
+# "Lee, C.") stranded by the blind ", ".split() below.
+MIDDLE_INITIAL_RE = re.compile(r"^[A-Z]\.?$")
+# A "Senator(s)"/"Representative(s)" role-prefix with no name attached,
+# including the garbled/truncated form missing the closing paren
+# (e.g. "Senator(s" with no name and no ")").
+PLACEHOLDER_VOTER_RE = re.compile(r"^(Senator|Representative)\(s\)?$", re.IGNORECASE)
+
+
+def fill_implied_yeas(vote, members, yeas):
+    # Floor actions name only the members who didn't vote a plain aye; every
+    # other member seated that day voted aye
+    listed = {v["voter_name"] for v in vote.votes}
+    implied = [m for m in members if m not in listed]
+    listed_yeas = sum(v["option"] == "yes" for v in vote.votes)
+    if implied and listed <= set(members) and len(implied) == yeas - listed_yeas:
+        for name in implied:
+            vote.yes(name)
+
+
 def split_specific_votes(voters):
     if voters is None or voters.startswith("none") or voters == "":
         return []
@@ -75,8 +105,31 @@ def split_specific_votes(voters):
         voters = voters.replace("Senator(s) ", "")
     elif voters.startswith("Representative(s)"):
         voters = voters.replace("Representative(s)", "")
+    elif voters.startswith("Senator(s"):
+        # malformed/truncated source data, e.g. "Senator(s" with no name and
+        # no closing paren -- nothing usable to parse out
+        voters = voters[len("Senator(s") :]
+    elif voters.startswith("Representative(s"):
+        voters = voters[len("Representative(s") :]
+
     # Remove trailing spaces and semicolons
-    return (v.rstrip(" ;") for v in voters.split(", "))
+    tokens = [v.rstrip(" ;") for v in voters.split(", ")]
+
+    # Re-merge middle-initial fragments (e.g. "Lee", "C." -> "Lee, C.") that
+    # the blind ", ".split() above breaks apart, and drop any leftover
+    # unparseable role placeholders instead of treating them as voters.
+    merged = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if MIDDLE_INITIAL_RE.match(token) and merged:
+            merged[-1] = f"{merged[-1]}, {token}"
+        elif PLACEHOLDER_VOTER_RE.match(token):
+            logger.warning("Dropping unparseable placeholder voter name: %r", token)
+        else:
+            merged.append(token)
+    return merged
 
 
 class HIBillScraper(Scraper):
@@ -172,18 +225,31 @@ class HIBillScraper(Scraper):
                     bill_chamber=bill_chamber,
                     legislative_session=session,
                     motion_text=motion_text,
-                    result="pass" if "passed" in string.lower() else "fail",
+                    result=(
+                        "pass"
+                        if re.search("passed|adopted", string, re.IGNORECASE)
+                        else "fail"
+                    ),
                     classification="passage",
                 )
                 reconsiderations.discard(actor)
                 vote.add_source(url)
-                yays = v["n_yes"]
-                nays = v["n_no"]
+                members = [
+                    name
+                    for name, start, end in self.members.get(actor, [])
+                    if start <= date <= end
+                ]
+                nays = int(v["n_no"] or 0)
+                excused = int(v["n_excused"] or 0)
+                if "n_yes" in v:
+                    yays = int(v["n_yes"] or 0)
+                else:
+                    yays = (len(members) or HOUSE_SEATS) - nays - excused
                 v_yes = v.get("yes", "")
                 v_no = v.get("no", "")
-                vote.set_count("yes", int(yays or 0))
-                vote.set_count("no", int(nays or 0))
-                vote.set_count("not voting", int(v["n_excused"] or 0))
+                vote.set_count("yes", yays)
+                vote.set_count("no", nays)
+                vote.set_count("not voting", excused)
                 vote.dedupe_key = f"{index}#{bill_id}#{date}#{string[:300]}"
                 for voter in split_specific_votes(v_yes):
                     voter = self.clean_voter_name(voter)
@@ -197,6 +263,7 @@ class HIBillScraper(Scraper):
                 for voter in split_specific_votes(v["excused"]):
                     voter = self.clean_voter_name(voter)
                     vote.vote("not voting", voter)
+                fill_implied_yeas(vote, members, yays)
 
                 yield vote
 
@@ -438,6 +505,7 @@ class HIBillScraper(Scraper):
 
     def parse_vote(self, action):
         # Try regex for a couple of edge cases
+        action = action.strip()
         result = None
         for vote_re in vote_re_list:
             result = re.search(vote_re, action, re.VERBOSE)
@@ -446,7 +514,7 @@ class HIBillScraper(Scraper):
         if result is None:
             return None
         result = result.groupdict()
-        motion = action.split(".")[0] + "."
+        motion = (result.get("motion") or action.split(".")[0]) + "."
         return result, motion
 
     def scrape_type(self, chamber, session, billtype):
@@ -475,6 +543,12 @@ class HIBillScraper(Scraper):
 
     def scrape(self, chamber=None, session=None, scrape_since=None):
         get_short_codes(self)
+        extras = next(
+            s.get("extras", {})
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
+        self.members = get_members(self, session, extras.get("appointed", {}))
 
         if scrape_since is None:
             bill_types = ["bill", "cr", "r"]
@@ -530,7 +604,7 @@ class HIBillScraper(Scraper):
             for each in self.jurisdiction.legislative_sessions
             if each["_scraped_name"] == scraped_name
         )
-        return details["name"]
+        return details["identifier"]
 
     def classify_bill_type(self, bill: str) -> tuple:
         billtypes = {

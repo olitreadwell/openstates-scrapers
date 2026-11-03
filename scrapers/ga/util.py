@@ -34,7 +34,12 @@ def backoff(function, *args, **kwargs):
     for attempt in range(retries):
         try:
             return _()
-        except (socket.timeout, urllib.error.URLError, suds.WebFault) as e:
+        except (
+            socket.timeout,
+            ConnectionError,
+            urllib.error.URLError,
+            suds.WebFault,
+        ) as e:
             if "This Roll Call Vote is not published." in str(e):
                 raise ValueError("Roll Call Vote isn't published")
 
@@ -100,4 +105,4 @@ def get_token():
     token_url = (
         f"https://www.legis.ga.gov/api/authentication/token?key={key}&ms={timestamp}"
     )
-    return "Bearer " + requests.get(token_url).json()
+    return "Bearer " + requests.get(token_url, timeout=30).json()

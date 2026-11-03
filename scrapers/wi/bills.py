@@ -23,10 +23,11 @@ TIMEZONE = pytz.timezone("US/Central")
 
 
 class WIBillScraper(Scraper):
-    subjects = defaultdict(list)
+    subjects = {}
     categorizer = Categorizer()
 
     def scrape_subjects(self, year, site_id):
+        subjects = defaultdict(list)
         last_url = None
         next_url = (
             f"https://docs.legis.wisconsin.gov/{year}/related/subject_index/index"
@@ -47,31 +48,36 @@ class WIBillScraper(Scraper):
             # get the 'Down' url
             next_url = doc.xpath('//a[text()="Down"]/@href')[0]
 
-            # slug is upper case in links for special sessions
-            if site_id != "reg":
-                site_id = site_id.upper()
-            a_path = "/document/session/%s/%s/" % (year, site_id)
+            # slug is upper case in links, including "REG"
+            a_path = "/document/session/%s/%s/" % (year, site_id.upper())
 
             # find all bill links to bills in this session
             for bill_a in doc.xpath('//a[contains(@href, "%s")]' % a_path):
                 bill_id = bill_a.text_content().split()[-1]
 
-                # subject is in the immediately preceding span
+                # subject is the first text of the nearest preceding subject div
                 preceding_subject = bill_a.xpath(
-                    './preceding::div[contains(@class,"qsSubject")]/text()'
+                    './preceding::div[contains(@class,"qsSubject")][1]/text()'
                 )
                 # there wasn't a subject get the one from end of the prior page
                 if not preceding_subject:
-                    preceding_subject = last_subject[0]
+                    preceding_subject = last_subject
                 else:
-                    preceding_subject = preceding_subject[-1]
-                preceding_subject = preceding_subject.replace("\xe2\x80\x94", "")
-                self.subjects[bill_id].append(preceding_subject)
+                    preceding_subject = preceding_subject[0]
+                # "Road, see also <links>" still lists its own bills under "Road"
+                preceding_subject = re.sub(
+                    r",\s*see\b.*$", "", preceding_subject.strip()
+                )
+                subjects[bill_id].append(preceding_subject)
 
             # last subject on the page, in case we get a bill_id on next page
-            last_subject_div = doc.xpath('//div[contains(@class,"qsSubject")]/text()')
+            last_subject_div = doc.xpath(
+                '(//div[contains(@class,"qsSubject")])[last()]/text()'
+            )
             if last_subject_div:
                 last_subject = last_subject_div[0]
+
+        return subjects
 
     def scrape(self, chamber=None, session=None):
         chambers = [chamber] if chamber is not None else ["upper", "lower"]
@@ -85,8 +91,8 @@ class WIBillScraper(Scraper):
         site_id = SESSION_SITE_IDS.get(session, "reg")
         chamber_slug = {"upper": "sen", "lower": "asm"}[chamber]
 
-        if not self.subjects:
-            self.scrape_subjects(year, site_id)
+        if session not in self.subjects:
+            self.subjects[session] = self.scrape_subjects(year, site_id)
 
         types = ("bill", "joint_resolution", "resolution")
 
@@ -134,14 +140,14 @@ class WIBillScraper(Scraper):
                 chamber=chamber,
                 classification=bill_type,
             )
-            bill.subject = list(set(self.subjects[bill_id]))
+            bill.subject = list(set(self.subjects[session][bill_id]))
             yield from self.scrape_bill_history(bill, bill_url, chamber)
 
             yield bill
 
     def scrape_bill_history(self, bill, url, chamber):
         seen_votes = set()
-        body = self.get(url).text
+        body = self.get(url, verify=False).text
         doc = lxml.html.fromstring(body)
         doc.make_links_absolute(url)
 
@@ -184,7 +190,9 @@ class WIBillScraper(Scraper):
                 "Record of Committee Proceedings",
             ):
                 extra_doc_url = a.get("href")
-                extra_doc = lxml.html.fromstring(self.get(extra_doc_url).text)
+                extra_doc = lxml.html.fromstring(
+                    self.get(extra_doc_url, verify=False).text
+                )
                 extra_doc.make_links_absolute(extra_doc_url)
                 for extra_a in extra_doc.xpath('//ul[@class="docLinks"]/li//a'):
                     if extra_a.text:
@@ -209,22 +217,19 @@ class WIBillScraper(Scraper):
             attrs = self.categorizer.categorize(action)
             atype = attrs["classification"]
 
-            kwargs = {}
-            if "referral-committee" in (atype or ""):
-                kwargs["related_entities"] = [
-                    {
-                        "entity_type": "committee",
-                        "name": re.sub(
-                            "R(ead (first time )?and r)?eferred to committee",
-                            "",
-                            action,
-                        ),
-                    }
-                ]
-
-            bill.add_action(
+            act = bill.add_action(
                 action, TIMEZONE.localize(date), chamber=actor, classification=atype
             )
+            committee = re.search(
+                r"referred to (joint (?:survey )?)?committee on (.+?)( pursuant to .*)?$",
+                action,
+                re.I,
+            )
+            if committee:
+                joint, name, _ = committee.groups()
+                if joint:
+                    name = f"{joint.title()}Committee on {name}"
+                act.add_related_entity(name, "organization")
 
             # Amendment links, only on passage
             if atype is not None and "amendment-passage" in atype:
@@ -235,11 +240,14 @@ class WIBillScraper(Scraper):
                     amd_link = amd_link_elems[0]
                     version_name = amd_link.text_content()
                     version_url = amd_link.get("href")
+                    # substitute amendments are full bill text
+                    classification = "" if "Substitute" in version_name else "amendment"
                     bill.add_version_link(
                         version_name,
                         version_url,
                         media_type="text/html",
                         on_duplicate="ignore",
+                        classification=classification,
                     )
                     pdf_url = "{}.pdf".format(version_url)
                     bill.add_version_link(
@@ -247,6 +255,7 @@ class WIBillScraper(Scraper):
                         pdf_url,
                         media_type="application/pdf",
                         on_duplicate="ignore",
+                        classification=classification,
                     )
 
             # if this is a vote, add a Vote to the bill
@@ -268,8 +277,8 @@ class WIBillScraper(Scraper):
 
         for line in lines:
             match = re.match(
-                "(Introduced|Cosponsored) by (?:joint )?(Senator|Representative|committee|Joint Legislative Council|Law Revision Committee)s?(.*)",  # noqa
-                line,
+                "(Introduced|[Cc]osponsored) by (?:joint )?(Senator|Representative|committee|Joint Legislative Council|Law Revision Committee)s?(.*)",  # noqa
+                line.strip(),
             )
             if not match:
                 # So far, the only one that doesn't match is
@@ -289,7 +298,7 @@ class WIBillScraper(Scraper):
 
             if type == "Introduced":
                 sponsor_type = "primary"
-            elif type == "Cosponsored":
+            else:
                 sponsor_type = "cosponsor"
 
             entity_type = "person"
@@ -333,7 +342,12 @@ class WIBillScraper(Scraper):
             classification=vtype,
             bill=bill,
         )
-        v.dedupe_key = f'{url.split("/")[-1]}-{bill.identifier}'
+        # a bill can have several roll calls on the same day with identical rolls
+        # (e.g. av0131 and av0132), so keep the roll call number to tell them apart
+        roll_call = url.split("/")[-1]
+        if re.match(r"^[as]v\d+$", roll_call):
+            v.identifier = roll_call
+        v.dedupe_key = f"{roll_call}-{bill.identifier}"
         v.set_count("yes", yes)
         v.set_count("no", no)
 
@@ -350,7 +364,7 @@ class WIBillScraper(Scraper):
 
     def add_senate_votes(self, vote, url):
         try:
-            html = self.get(url).text
+            html = self.get(url, verify=False).text
         except scrapelib.HTTPError:
             self.warning("No Senate Votes found for %s" % url)
             return
@@ -389,7 +403,7 @@ class WIBillScraper(Scraper):
 
     def add_house_votes(self, vote, url):
         try:
-            html = self.get(url).content
+            html = self.get(url, verify=False).content
         except scrapelib.HTTPError:
             self.warning("No House Votes found for %s" % url)
             return
@@ -407,11 +421,16 @@ class WIBillScraper(Scraper):
         vote.set_count("no", int(vote_counts[0][1]))
         vote.set_count("not voting", int(vote_counts[0][2]))
 
+        # the roll lists the Speaker as "SPEAKER"; the header names them ("Speaker Vos")
+        speaker = doc.xpath('string(//strong[starts-with(., "Speaker ")])')[8:]
+
         yes_names_count = 0
         no_names_count = 0
 
         for td in doc.xpath("//tbody/tr/td[4]"):
             name = td.text_content()
+            if name == "SPEAKER" and speaker:
+                name = speaker.upper()
             for vote_td in td.xpath("./preceding-sibling::td"):
                 if vote_td.text_content() == "Y":
                     vote.vote("yes", name)
@@ -419,7 +438,8 @@ class WIBillScraper(Scraper):
                 elif vote_td.text_content() == "N":
                     vote.vote("no", name)
                     no_names_count += 1
-                elif vote_td.text_content() == "NV":
+                # the NV column is marked with a lowercase "x"
+                elif vote_td.text_content() in ("NV", "x"):
                     vote.vote("not voting", name)
 
         if yes_names_count != int(vote_counts[0][0]):

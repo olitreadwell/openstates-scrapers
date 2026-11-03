@@ -106,6 +106,17 @@ class IDBillScraper(Scraper):
                 self.warning("Unable to load subjects.")
                 self._subjects = defaultdict(list)
 
+        self.speaker = next(
+            s.get("extras", {}).get("house_speaker")
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
+        if not self.speaker:
+            self.warning(
+                f"No house_speaker in {session} session extras; "
+                "roll calls will list the title"
+            )
+
         # if you need to scrape a single bill
         # yield from self.scrape_bill("lower", "2026", "H 0978")
         # return
@@ -165,8 +176,16 @@ class IDBillScraper(Scraper):
         for link in doc_links:
             name = link.text_content().strip()
             href = link.get("href")
+            classification = ""
             if "Engrossment" in name or "Bill Text" in name or "Amendment" in name:
-                bill.add_version_link(note=name, url=href, media_type="application/pdf")
+                if "amendment" in name.lower():
+                    classification = "amendment"
+                bill.add_version_link(
+                    note=name,
+                    url=href,
+                    classification=classification,
+                    media_type="application/pdf",
+                )
             else:
                 bill.add_document_link(
                     note=name, url=href, media_type="application/pdf"
@@ -287,8 +306,17 @@ class IDBillScraper(Scraper):
                 for name in name_text.split(",")
                 if name
             ]
-            name_list = [name.split("(")[0] for name in name_list]
-            return name_list
+            # keep district numbers like "Crane(12)" that tell same-surname
+            # members apart; drop other parentheticals like "Erickson(Larsen)"
+            name_list = [
+                name if re.search(r"\(\d+\)$", name) else name.split("(")[0]
+                for name in name_list
+            ]
+            # House rolls list the Speaker by title
+            return [
+                self.speaker or name if name == "Mr. Speaker" else name
+                for name in name_list
+            ]
         return []
 
     def parse_vote(self, actor, date, row, session, bill_id, bill_chamber, source):
@@ -301,12 +329,16 @@ class IDBillScraper(Scraper):
         passed, yes_count, no_count, other_count = (
             spans[0].text_content().rsplit("-", 3)
         )
-        yes_votes = self.get_names(spans[1].tail)
-        no_votes = self.get_names(spans[2].tail)
-
-        other_votes = []
-        for span in spans[3:]:
-            if span.text.startswith(("Absent", "Excused")):
+        # find each list by its label; extra spans like "Tie vote - President
+        # voted NAY" can appear before AYES
+        yes_votes, no_votes, other_votes = [], [], []
+        for span in spans[1:]:
+            label = span.text_content()
+            if label.startswith("AYES"):
+                yes_votes = self.get_names(span.tail)
+            elif label.startswith("NAYS"):
+                no_votes = self.get_names(span.tail)
+            elif label.startswith(("Absent", "Excused")):
                 other_votes += self.get_names(span.tail)
         for key, val in {"adopted": "pass", "passed": "pass", "failed": "fail"}.items():
             if key in passed.lower():

@@ -1,7 +1,7 @@
 from openstates.scrape import State
 from .bills import MTBillScraper
 from .events import MTEventScraper
-import requests
+import scrapelib
 
 
 class Montana(State):
@@ -69,8 +69,17 @@ class Montana(State):
             "name": "2025 Regular Session",
             "start_date": "2025-01-06",
             "end_date": "2025-05-03",
-            "active": True,
+            "active": False,
             "extras": {"legislatureOrdinal": 69, "newAPIIdentifier": 2},
+        },
+        {
+            "_scraped_name": "20271",
+            "identifier": "2027",
+            "name": "2027 Regular Session",
+            "start_date": "2027-01-04",
+            "end_date": "2027-04-30",
+            "active": True,
+            "extras": {"legislatureOrdinal": 70, "newAPIIdentifier": 3},
         },
     ]
     ignored_scraped_sessions = [
@@ -90,13 +99,14 @@ class Montana(State):
         # archive of sessions
         url = "https://api.legmt.gov/archive/v1/sessions"
         sessions = []
-        page = requests.get(url).json()
+        scraper = scrapelib.Scraper()
+        page = scraper.get(url, timeout=60).json()
         for row in page:
             sessions.append(str(row["sessionId"]))
 
         # incoming session can be found in another endpoint
         legislators_sessions_url = "https://api.legmt.gov/legislators/v1/sessions"
-        page = requests.get(legislators_sessions_url).json()
+        page = scraper.get(legislators_sessions_url, timeout=60).json()
         for row in page:
             # skip if this session was already found above
             if row["ordinals"] in sessions:

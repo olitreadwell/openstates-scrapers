@@ -77,6 +77,11 @@ class AZBillScraper(Scraper):
         page = json.loads(
             self.get(versions_url, timeout=80, verify=False).content.decode("utf-8")
         )
+        # azleg reuses identical DocumentName values (e.g. multiple
+        # "HOUSE - Commerce - Strike Everything" drafts) for distinct documents
+        # (different Id / content), so track seen names to keep them as
+        # separate versions instead of collapsing into one.
+        seen_version_notes = set()
         for document_set in page:
             type_ = document_set["DocumentGroupName"]
             for doc in document_set["Documents"]:
@@ -91,15 +96,25 @@ class AZBillScraper(Scraper):
                     url = "https://apps.azleg.gov{}".format(url)
 
                 if type_ in version_types:
+                    note = doc["DocumentName"]
+                    if note in seen_version_notes:
+                        note = "{} ({})".format(note, doc["Id"])
+                    seen_version_notes.add(doc["DocumentName"])
+                    classification = "amendment" if "amend" in type_.lower() else ""
+
                     if media_type == "text/html":
                         pdf_url = re.sub("(.docx)?.htm(l)?$", ".pdf", url.lower())
                         bill.add_version_link(
-                            note=doc["DocumentName"],
+                            note=note,
                             url=pdf_url,
                             media_type="application/pdf",
+                            classification=classification,
                         )
                     bill.add_version_link(
-                        note=doc["DocumentName"], url=url, media_type=media_type
+                        note=note,
+                        classification=classification,
+                        url=url,
+                        media_type=media_type,
                     )
                 else:
                     bill.add_document_link(
@@ -329,13 +344,18 @@ class AZBillScraper(Scraper):
                 Some example votes don't have every key we expect, either,
                 so we should try to handle comparisons cleanly
                 """
-                result = "fail"
-                if (
-                    action.get("UnanimouslyAdopted", False)
-                    or ayes > nays
-                    or action["Action"] == "Passed"
-                ):
+                # Committee of the Whole voice votes ("do pass", "do pass amended")
+                # have no counts, and "failed to pass" can have more ayes than nays
+                # when a two-thirds vote was needed, so trust the stated action first
+                action_text = action["Action"].lower()
+                if action_text.startswith(("passed", "do pass")):
                     result = "pass"
+                elif action_text.startswith(("failed", "retained")):
+                    result = "fail"
+                elif action.get("UnanimouslyAdopted", False) or ayes > nays:
+                    result = "pass"
+                else:
+                    result = "fail"
 
                 vote = VoteEvent(
                     chamber={"S": "upper", "H": "lower"}[header["LegislativeBody"]],
@@ -364,7 +384,7 @@ class AZBillScraper(Scraper):
                     "excused",
                     (
                         action["Excused"]
-                        if "Present" in action and action["Present"]
+                        if "Excused" in action and action["Excused"]
                         else 0
                     ),
                 )
@@ -378,7 +398,16 @@ class AZBillScraper(Scraper):
                 )
 
                 for v in action["Votes"]:
-                    vote_type = {"Y": "yes", "N": "no"}.get(v["Vote"], "other")
+                    # "V" marks a vacant seat, listed under the member who
+                    # last held it; it's counted in "Vacant", not as a vote
+                    if v["Vote"] == "V":
+                        continue
+                    vote_type = {
+                        "Y": "yes",
+                        "N": "no",
+                        "NV": "not voting",
+                        "E": "excused",
+                    }.get(v["Vote"], "other")
                     vote.vote(vote_type, v["Legislator"]["FullName"])
                 vote.dedupe_key = f"{resp.url}{action['ReferralNumber']}"
                 yield vote

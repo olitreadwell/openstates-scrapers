@@ -1,4 +1,5 @@
 import pytz
+import re
 import urllib
 from datetime import datetime
 import dateutil
@@ -14,7 +15,6 @@ TIMEZONE = pytz.timezone("US/Central")
 class NEBillScraper(Scraper, LXMLMixin):
     priority_bills = {}
     # SSL bad as of 2024-11-18
-    verify = False
 
     def scrape(self, session=None):
         if session is None:
@@ -254,7 +254,10 @@ class NEBillScraper(Scraper, LXMLMixin):
             # adopted amendments get added as versions, everything else goes into documents
             if "adopted" in status.lower():
                 bill.add_version_link(
-                    amendment_name, amendment_url, media_type="application/pdf"
+                    amendment_name,
+                    amendment_url,
+                    classification="amendment",
+                    media_type="application/pdf",
                 )
             else:
                 amendment_name = f"{amendment_name} ({status})"
@@ -294,7 +297,15 @@ class NEBillScraper(Scraper, LXMLMixin):
             date = datetime.strptime(date_td.text, "%b %d, %Y")
             motion_text = motion_td.text_content()
             vote_page = self.lxmlize(vote_url, verify=False)
-            passed = "Passed" in motion_text or "Advanced" in motion_text
+            # history text states the outcome ("AM2962 adopted", "MO46 prevailed")
+            if re.search(r"\b(failed|lost)\b", motion_text, re.IGNORECASE):
+                passed = False
+            elif re.search(
+                r"\b(passed|advanced|adopted|prevailed)\b", motion_text, re.IGNORECASE
+            ):
+                passed = True
+            else:
+                passed = None
 
             vote = VoteEvent(
                 bill=bill,
@@ -307,6 +318,8 @@ class NEBillScraper(Scraper, LXMLMixin):
 
             yes_voters, yes_count = self.get_votes(vote_page, "Yes :")
             no_voters, no_count = self.get_votes(vote_page, "No :")
+            if passed is None:
+                vote.result = "pass" if yes_count > no_count else "fail"
             exc_voters, exc_count = self.get_votes(vote_page, "Excused Not Voting:")
             abs_voters, absent_count = self.get_votes(vote_page, "Absent Not Voting:")
             pre_voters, present_count = self.get_votes(vote_page, "Present Not Voting:")

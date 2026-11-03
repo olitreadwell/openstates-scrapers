@@ -41,6 +41,30 @@ def toggle_http_version(method):
     return wrapper
 
 
+def split_columns(pages):
+    """
+    Split the fixed-width name columns of a roll call page into names.
+    Splitting on runs of spaces drops a name whenever a long one leaves a
+    single space before the next column, so cut each line at the column
+    offsets that page uses.
+    :param pages: list of lists of lines, one list per page of a section
+    :return: generator of names
+    """
+    for lines in pages:
+        offsets = sorted(
+            {
+                match.start()
+                for line in lines
+                for match in re.finditer(r"(?:^|(?<=\s{2}))\S", line)
+            }
+        )
+        for line in lines:
+            for start, end in zip(offsets, offsets[1:] + [len(line)]):
+                name = line[start:end].strip()
+                if name:
+                    yield name
+
+
 def action_type(action):
     """
     Used to standardise the bill actions to the terms specified
@@ -113,8 +137,10 @@ def get_index_url(session, chamber, chamber_letter):
         "2019-2020-upper": "20201101152857",
         "2021-2022-lower": "20221110101038",
         "2021-2022-upper": "20221110101352",
+        "2023-2024-lower": "20241005102943",
+        "2023-2024-upper": "20241012085424",
         # TODO: Add archive id values for both chambers for outgoing session
-        #  during transition between sessions (Upcoming: Nov or Dec 2024).
+        #  during transition between sessions (Upcoming: Nov or Dec 2026).
     }
 
     web_archive_id = web_archive_ids.get(f"{session}-{chamber}", None)
@@ -281,13 +307,13 @@ class SCBillScraper(Scraper):
 
             # obtain vote rollcall from pdf and add it to the VoteEvent object
             rollcall_pdf = vote_link.get("href")
-            self.scrape_rollcall(vote, rollcall_pdf)
-            vote.add_source(rollcall_pdf)
             if rollcall_pdf in self._seen_vote_ids:
                 self.warning("duplicate usage of %s, skipping", rollcall_pdf)
                 continue
             else:
                 self._seen_vote_ids.add(rollcall_pdf)
+            self.scrape_rollcall(vote, rollcall_pdf)
+            vote.add_source(rollcall_pdf)
             vote.dedupe_key = rollcall_pdf  # distinct KEY for each one
 
             yield vote
@@ -303,44 +329,44 @@ class SCBillScraper(Scraper):
         pdflines = convert_pdf(path, "text")
         os.remove(path)
 
-        current_vfunc = None
-        option = None
+        # one (vote function, option, pages) per section of the roll call
+        sections = []
 
-        for line in pdflines.split(b"\n"):
-            line = line.strip().decode()
+        for raw_line in pdflines.split(b"\n"):
+            raw_line = raw_line.decode()
+            line = raw_line.strip()
 
             # change what is being recorded
             if line.startswith("YEAS") or line.startswith("AYES"):
-                current_vfunc = vote.yes
+                sections.append((vote.yes, None, [[]]))
             elif line.startswith("NAYS"):
-                current_vfunc = vote.no
+                sections.append((vote.no, None, [[]]))
             elif line.startswith("EXCUSED"):
-                current_vfunc = vote.vote
-                option = "excused"
+                sections.append((vote.vote, "excused", [[]]))
             elif line.startswith("NOT VOTING"):
-                current_vfunc = vote.vote
-                option = "excused"
+                sections.append((vote.vote, "not voting", [[]]))
             elif line.startswith("ABSTAIN"):
-                current_vfunc = vote.vote
-                option = "excused"
+                sections.append((vote.vote, "abstain", [[]]))
             elif line.startswith("PAIRED"):
-                current_vfunc = vote.vote
-                option = "paired"
+                sections.append((vote.vote, "paired", [[]]))
 
             # skip these
             elif not line or line.startswith("Page "):
                 continue
 
-            # if a vfunc is active
-            elif current_vfunc:
-                # split names apart by 3 or more spaces
-                names = re.split(r"\s{3,}", line)
-                for name in names:
-                    if name:
-                        if not option:
-                            current_vfunc(name.strip())
-                        else:
-                            current_vfunc(option=option, voter=name.strip())
+            # if a section is active
+            elif sections:
+                # a page break starts a fresh set of columns
+                if "\f" in raw_line:
+                    sections[-1][2].append([])
+                sections[-1][2][-1].append(raw_line.replace("\f", "").rstrip())
+
+        for current_vfunc, option, pages in sections:
+            for name in split_columns(pages):
+                if not option:
+                    current_vfunc(name)
+                else:
+                    current_vfunc(option=option, voter=name)
 
     def scrape_details(self, bill_detail_url, session, chamber, bill_id):
         """
@@ -494,6 +520,8 @@ class SCBillScraper(Scraper):
         :param session:
         """
         self._seen_vote_ids = set()
+        # prefiled bills are listed on both the prefile and intro day pages
+        seen_bill_ids = set()
 
         # Subject scraping disabled Summer 2020, openstates/issues#77
         # Leaving the remnants of this around since it is very possible that SC will
@@ -539,7 +567,11 @@ class SCBillScraper(Scraper):
 
                 for bill_a in doc.xpath("//p/a[1]"):
                     bill_id = bill_a.text.replace(".", "")
-                    if bill_id.lower().startswith(chamber_letter):
+                    if (
+                        bill_id.lower().startswith(chamber_letter)
+                        and bill_id not in seen_bill_ids
+                    ):
+                        seen_bill_ids.add(bill_id)
                         yield from self.scrape_details(
                             bill_a.get("href"), session, chamber, bill_id
                         )
@@ -568,7 +600,11 @@ class SCBillScraper(Scraper):
 
                 for bill_a in doc.xpath("//p/a[1]"):
                     bill_id = bill_a.text.replace(".", "")
-                    if bill_id.lower().startswith(chamber_letter):
+                    if (
+                        bill_id.lower().startswith(chamber_letter)
+                        and bill_id not in seen_bill_ids
+                    ):
+                        seen_bill_ids.add(bill_id)
                         yield from self.scrape_details(
                             bill_a.get("href"), session, chamber, bill_id
                         )

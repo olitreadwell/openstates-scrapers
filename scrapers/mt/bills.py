@@ -1,7 +1,6 @@
 from openstates.scrape import Scraper, Bill, VoteEvent
 
 from .actions import categorize_actions
-import requests
 import scrapelib
 import dateutil
 import pytz
@@ -54,7 +53,7 @@ class MTBillScraper(Scraper):
     def scrape_legislators(self):
         self.legislators = []
         url = "https://api.legmt.gov/legislators/v1/legislators"
-        response = requests.get(url).json()
+        response = self.get(url).json()
 
         for legislator in response:
             self.legislators.append(
@@ -95,7 +94,7 @@ class MTBillScraper(Scraper):
     def scrape_requesting_agencies(self):
         self.requesting_agencies = []
         url = "https://api.legmt.gov/legislators/v1/organizations"
-        response = requests.get(url).json()
+        response = self.get(url).json()
 
         for agency in response:
             self.requesting_agencies.append(
@@ -111,7 +110,7 @@ class MTBillScraper(Scraper):
         url = "https://api.legmt.gov/committees/v1/nonStandingCommittees/search"
         params = {"limit": 500, "offset": 0}
         json_data = {"legislatureIds": [self.new_api_session_identifier]}
-        response = requests.post(url, params=params, json=json_data).json()
+        response = self.post(url, params=params, json=json_data).json()
 
         for committee in response["content"]:
             cmte_code = committee["committeeDetails"]["committeeCode"]
@@ -128,7 +127,7 @@ class MTBillScraper(Scraper):
     def scrape_standing_committees(self):
         self.standing_committees = []
         url = f"https://api.legmt.gov/committees/v1/standingCommittees/findBySessionId?sessionId={self.new_api_session_identifier}"
-        response = requests.get(url).json()
+        response = self.get(url).json()
 
         for committee in response:
             cmte_code = committee["committeeDetails"]["committeeCode"]
@@ -145,9 +144,8 @@ class MTBillScraper(Scraper):
     def scrape_list_page(self, session, page_num: int):
         self.info(f"Scraping page {str(page_num)}")
         params = {
-            "limit": str(self.results_per_page),
+            "limit": "1000",
             "offset": str(page_num),
-            "includeCounts": "true",  # TODO do we need the "counts" part of response?
             "sort": ["billType.code,desc", "billNumber,asc", "draft.draftNumber,asc"],
         }
 
@@ -155,7 +153,7 @@ class MTBillScraper(Scraper):
             "sessionIds": [self.new_api_session_identifier],
         }
 
-        response = requests.post(
+        response = self.post(
             "https://api.legmt.gov/bills/v1/bills/search", params=params, json=json_data
         ).json()
 
@@ -217,10 +215,12 @@ class MTBillScraper(Scraper):
                         )
 
             yield bill
-            yield from self.scrape_votes(bill, str(row["id"]))
-            yield from self.scrape_committee_votes(bill, str(row["id"]))
+            # LC drafts have no floor or committee votes
+            if not is_draft:
+                yield from self.scrape_votes(bill, str(row["id"]))
+                yield from self.scrape_committee_votes(bill, str(row["id"]))
 
-        if response["totalPages"] > page_num:
+        if response["totalPages"] > page_num + 1:
             yield from self.scrape_list_page(session, page_num + 1)
 
     def scrape_actions(self, bill: Bill, row: dict):
@@ -303,7 +303,7 @@ class MTBillScraper(Scraper):
             # "sortBy": "billNumber", # it appears that giving no sort defaults to revcron
         }
 
-        page = requests.post(
+        page = self.post(
             "https://api.legmt.gov/archive/v1/bills/search",
             params=params,
             json=json_data,
@@ -496,6 +496,22 @@ class MTBillScraper(Scraper):
             # at least one example where this value is "null" in source
             # https://api.legmt.gov/bills/v1/votes/findByBillId?billId=2308
             motion = row["motion"] if row["motion"] else "Unknown"
+
+            # the API sometimes repeats a legislator's vote under a new record id
+            # (e.g. executiveActions billId=724, id 4221 lists all 21 members twice)
+            # so keep only the first vote per legislator
+            seen = set()
+            legislator_votes = []
+            for v in row["legislatorVotes"]:
+                leg_id = (
+                    v["legislatorId"]
+                    if "legislatorId" in v
+                    else v["membership"]["legislatorId"]
+                )
+                if leg_id not in seen:
+                    seen.add(leg_id)
+                    legislator_votes.append(v)
+            row["legislatorVotes"] = legislator_votes
 
             counts = {
                 "YES": 0,

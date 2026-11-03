@@ -135,6 +135,17 @@ class LABillScraper(Scraper, LXMLMixin):
                 self.start_year = i["start_date"][0:4]
                 if "extras" in i and "session_id" in i["extras"]:
                     session_id = i["extras"]["session_id"]
+                # Floor rolls list the presiding officers by title, not by name
+                self.presiding_officers = {
+                    "Mr. President": i.get("extras", {}).get("senate_president"),
+                    "Mr. Speaker": i.get("extras", {}).get("house_speaker"),
+                }
+                for title, officer in self.presiding_officers.items():
+                    if not officer:
+                        self.warning(
+                            f"No name for {title} in {session} session extras; "
+                            "roll calls will list the title"
+                        )
 
         chambers = [chamber] if chamber else ["upper", "lower"]
 
@@ -238,6 +249,7 @@ class LABillScraper(Scraper, LXMLMixin):
             elif line in ("Total", "--"):
                 vote_type = None
             elif vote_type:
+                line = self.presiding_officers.get(line) or line
                 if vote_type == "yes":
                     d["yes"].append(line)
                 elif vote_type == "no":
@@ -281,7 +293,22 @@ class LABillScraper(Scraper, LXMLMixin):
                 page.xpath("//a[contains(text(), '%s')]" % (x))[0].attrib["href"]
             )
 
-        authors = [x.text for x in sbp("Authors")]
+        def menu_links(label):
+            # The bill page's documents menu has the same links as the
+            # BillDocs.aspx subpages, but at most 20 per category (then a link
+            # to the subpage), and with commas stripped from document names
+            # (author names keep theirs).
+            for td in page.xpath(
+                "//td[starts-with(@id, 'ctl00_PageBody_MenuDocumentsn')]"
+            ):
+                if td.text_content().strip() == label:
+                    return page.xpath("//div[@id='%sItems']//a" % td.get("id"))
+            return []
+
+        author_links = menu_links("Authors")
+        if any("BillDocs.aspx" in a.get("href", "") for a in author_links):
+            author_links = sbp("Authors")
+        authors = [re.sub(r" \(primary\)$", "", x.text) for x in author_links]
 
         try:
             digests = sbp("Digests")
@@ -340,16 +367,19 @@ class LABillScraper(Scraper, LXMLMixin):
             if "href" in amendment.attrib:
                 bill.add_version_link(
                     note=amendment.text,
+                    classification="amendment",
                     url=amendment.attrib["href"],
                     media_type="application/pdf",
                 )
 
-        try:
+        # Vote names keep their commas only on the votes subpage, so fetch it,
+        # but only when the menu lists floor votes (or more than it shows)
+        if any(
+            re.search("ViewDocument|BillDocs", a.get("href", ""))
+            for a in menu_links("Votes")
+        ):
             votes_link = page.xpath("//a[text() = 'Votes']")[0]
             yield from self.scrape_votes(bill, votes_link.attrib["href"])
-        except IndexError:
-            # Some bills don't have any votes
-            pass
 
         for action in page.xpath("//table[.//th[contains(text(),'Journal')]]//tr")[1:]:
             date, chamber, page, text, *_ = [x.text for x in action.xpath(".//td")]

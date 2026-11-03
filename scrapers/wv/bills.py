@@ -52,6 +52,11 @@ class WVBillScraper(Scraper):
         return (year, session_type)
 
     def scrape(self, chamber=None, session=None):
+        self.senate_president = next(
+            s.get("extras", {}).get("senate_president")
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
         chambers = [chamber] if chamber is not None else ["upper", "lower"]
         for chamber in chambers:
             yield from self.scrape_chamber(chamber, session)
@@ -205,9 +210,15 @@ class WVBillScraper(Scraper):
                             primary=False,
                         )
 
-        for link in page.xpath("//a[contains(@href, 'votes/house')]"):
-            yield from self.scrape_house_vote(bill, link.attrib["href"])
+        # each House roll call is linked from both the history table and the
+        # bill bundle list
+        house_votes = dict.fromkeys(
+            page.xpath("//a[contains(@href, 'votes/house')]/@href")
+        )
+        for href in house_votes:
+            yield from self.scrape_house_vote(bill, href)
 
+        senate_votes = set()
         for tr in reversed(
             page.xpath("//table[@class='tabborder']/descendant::tr")[1:]
         ):
@@ -223,23 +234,22 @@ class WVBillScraper(Scraper):
             date = datetime.datetime.strptime(date, "%m/%d/%y").date()
 
             action = tds[1].text_content().strip()
-            if action.lower().startswith("passed senate"):
-                for href in tds[1].xpath("a/@href"):
-                    yield from self.scrape_senate_vote(bill, href, date)
+            for href in tds[1].xpath("a/@href"):
+                if "votes/senate" in href and href not in senate_votes:
+                    senate_votes.add(href)
+                    yield from self.scrape_senate_vote(bill, href, date, action)
 
-            attrs = dict(
-                chamber=chamber, description=action, date=date.strftime("%Y-%m-%d")
-            )
             temp = self.categorizer.categorize(action)
-            related_entities = []
-            for key, values in temp.items():
-                if key != "classification":
-                    for value in values:
-                        related_entities.append({"type": key, "name": value})
-            attrs.update(
-                classification=temp["classification"], related_entities=related_entities
+            act = bill.add_action(
+                action,
+                date.strftime("%Y-%m-%d"),
+                chamber=chamber,
+                classification=temp["classification"],
             )
-            bill.add_action(**attrs)
+            for name in temp["committees"]:
+                act.add_related_entity(name, "organization")
+            for name in temp["legislators"]:
+                act.add_related_entity(name.strip(), "person")
 
         yield bill
 
@@ -346,20 +356,33 @@ class WVBillScraper(Scraper):
         else:
             self.warning("Syntax Error/Warning using 'convert_pdf'")
 
-    def scrape_senate_vote(self, bill, url, date):
+    def scrape_senate_vote(self, bill, url, date, action):
         try:
             filename, resp = self.urlretrieve(url, verify=False)
         except scrapelib.HTTPError:
             self.warning("missing vote file %s" % url)
             return
 
+        if action.lower().startswith("passed senate"):
+            motion, classification = "Passage", "passage"
+        else:
+            # e.g. "Senate concurred in House amendments and passed bill",
+            # "Effective from passage", "Tarr amends to House amends rejected"
+            motion = re.sub(r"\s*\(Roll No\. \d+\)", "", action)
+            if "passed" in motion.lower():
+                classification = "passage"
+            elif "amend" in motion.lower():
+                classification = "amendment"
+            else:
+                classification = []
+
         vote = VoteEvent(
             chamber="upper",
             start_date=date.strftime("%Y-%m-%d"),
-            motion_text="Passage",
+            motion_text=motion,
             # setting 'fail' for now.
             result="fail",
-            classification="passage",
+            classification=classification,
             bill=bill,
         )
         vote.add_source(url)
@@ -418,7 +441,7 @@ class WVBillScraper(Scraper):
         actual_vote = collections.defaultdict(int)
         yes_count = 0
         no_count = 0
-        other_count = 0
+        absent_count = 0
         for line in lines:
             vals = re.findall(r"(?<!\w)(Y|N|A)\s+((?:\S+ ?)+)", line)
             for vote_val, name in vals:
@@ -428,6 +451,9 @@ class WVBillScraper(Scraper):
                 # was catching 'A squatter cannot be considered a tenant in WV.' as an absent vote
                 # on https://www.wvlegislature.gov/legisdocs/2024/RS/votes/senate/03-05-0369.pdf
                 if name.isupper():
+                    # Senate rolls list the presiding officer as "MR PRESIDENT"
+                    if name == "MR PRESIDENT":
+                        name = self.senate_president or name
                     if vote_val == "Y":
                         # Fix for "Class Y special hunting" in
                         # http://www.wvlegislature.gov/legisdocs/2020/RS/votes/senate/01-27-0033.pdf
@@ -440,18 +466,18 @@ class WVBillScraper(Scraper):
                         vote.no(name)
                         no_count += 1
                     else:
-                        vote.vote("other", name)
-                        other_count += 1
+                        vote.vote("absent", name)
+                        absent_count += 1
                     actual_vote[vote_val] += 1
         vote.set_count("yes", yes_count)
         vote.set_count("no", no_count)
-        vote.set_count("not voting", other_count)
+        vote.set_count("absent", absent_count)
         # updating result with actual value
-        vote.result = "pass" if yes_count > (no_count + other_count) else "fail"
+        vote.result = "pass" if yes_count > (no_count + absent_count) else "fail"
 
         assert yes_count == int(counts["Yea"])
         assert no_count == int(counts["Nay"])
-        assert other_count == int(counts["Absent"])
+        assert absent_count == int(counts["Absent"])
 
         yield vote
 
@@ -487,8 +513,16 @@ class WVBillScraper(Scraper):
             version_name = row.xpath("string(.)").strip()
             version_url = row.xpath("@href")[0]
             version_url = version_url.replace(" ", "%20")
+            # roll call PDFs ("... adopted (Roll No. 386)") match the selector
+            # too; they're already scraped as votes
+            if "_amends/" not in version_url:
+                continue
             bill.add_version_link(
-                version_name, version_url, media_type="text/html", on_duplicate="ignore"
+                version_name,
+                version_url,
+                classification="amendment",
+                media_type="text/html",
+                on_duplicate="ignore",
             )
 
     def scrape_versions(self, session, chamber, page, bill_id):

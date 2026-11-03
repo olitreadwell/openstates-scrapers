@@ -1,5 +1,6 @@
 import datetime as dt
 import lxml.html
+import pytz
 import re
 
 from openstates.scrape import Scraper, Bill, VoteEvent
@@ -87,6 +88,7 @@ class RIBillScraper(Scraper):
     # vote scrape
     _bill_id_by_type = {}
     categorizer = Categorizer()
+    _tz = pytz.timezone("US/Eastern")
 
     def parse_results_page(self, page):
         blocks = []
@@ -304,6 +306,22 @@ class RIBillScraper(Scraper):
 
     def scrape(self, chamber=None, session=None):
         chambers = [chamber] if chamber is not None else ["upper", "lower"]
+        extras = next(
+            s.get("extras", {})
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
+        # roll calls list the presiding officers by title, not by name
+        self.presiding_officers = {
+            "Madam President": extras.get("senate_president", []),
+            "Mr. Speaker": extras.get("house_speaker", []),
+        }
+        for title, officer in self.presiding_officers.items():
+            if not officer:
+                self.warning(
+                    f"No name for {title} in {session} session extras; "
+                    "roll calls will list the title"
+                )
 
         # NOTE: disabled by showerst 2024-01-04
         # this is making 350 POST requests because there are almost no subjects
@@ -312,8 +330,10 @@ class RIBillScraper(Scraper):
         # subjects = self.get_subject_bill_dict(session)
         subjects = {}
 
+        # each chamber's vote pages include roll calls on the other chamber's bills
         for chamber in chambers:
             yield from self.scrape_bills(chamber, session, subjects)
+        for chamber in chambers:
             yield from self.scrape_chamber_votes(chamber, session)
 
     def scrape_chamber_votes(self, chamber, session):
@@ -328,36 +348,47 @@ class RIBillScraper(Scraper):
             for vote_dict in votes:
                 for vote in vote_dict.values():
                     count = vote["count"]
-                    chamber = {"H": "lower", "S": "upper"}[vote["meta"]["chamber"]]
+                    bill_chamber = {"H": "lower", "S": "upper"}[vote["meta"]["chamber"]]
 
                     try:
-                        bill_id = self._bill_id_by_type[(chamber, vote["meta"]["bill"])]
+                        bill_id = self._bill_id_by_type[
+                            (bill_chamber, vote["meta"]["bill"])
+                        ]
                     except KeyError:
                         self.warning(
-                            "no such bill_id %s %s", chamber, vote["meta"]["bill"]
+                            "no such bill_id %s %s", bill_chamber, vote["meta"]["bill"]
                         )
                         continue
 
                     v = VoteEvent(
                         chamber=chamber,
-                        start_date=vote["time"].strftime("%Y-%m-%d"),
+                        start_date=self._tz.localize(vote["time"]),
                         motion_text=vote["meta"]["extra"]["motion"],
                         result="pass" if count["passage"] else "fail",
                         classification="passage",
                         legislative_session=session,
                         bill=bill_id,
-                        bill_chamber=chamber,
+                        bill_chamber=bill_chamber,
                     )
                     v.set_count("yes", int(count["YEAS"]))
                     v.set_count("no", int(count["NAYS"]))
-                    v.set_count("other", int(count["NOT VOTING"]))
+                    # recused members are itemized as "other" too
+                    v.set_count(
+                        "other",
+                        int(count["NOT VOTING"]) + int(count.get("RECUSED", 0)),
+                    )
                     v.add_source(vote["source"])
                     v.dedupe_key = vote["source"]
 
                     for vt in vote["votes"]:
                         key = {"Y": "yes", "N": "no"}.get(vt["vote"], "other")
-                        v.vote(key, vt["name"])
+                        v.vote(key, self.presiding_officer(vt["name"], vote["time"]))
                     yield v
+
+    def presiding_officer(self, name, when):
+        terms = self.presiding_officers.get(name, [])
+        names = [officer for start, officer in terms if start <= f"{when:%Y-%m-%d}"]
+        return names[-1] if names else name
 
     def post_to(self, url, vote):
         headers = {"votedate": vote}

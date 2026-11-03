@@ -3,6 +3,8 @@ import re
 import time
 
 import lxml.html
+import requests
+import scrapelib
 
 from openstates.scrape import Scraper, VoteEvent
 
@@ -37,11 +39,7 @@ class KSVoteScraper(Scraper):
                 f"?page={page}&per_page=20"
             )
 
-            try:
-                response = self.get(list_url)
-            except Exception as e:
-                self.warning(f"Failed to fetch vote listing page {page}: {e}")
-                break
+            response = self.get(list_url)
 
             doc = lxml.html.fromstring(response.text)
 
@@ -65,6 +63,11 @@ class KSVoteScraper(Scraper):
                     session,
                 )
 
+            # Past the last page the site keeps returning the last page's
+            # rows, so stop when there is no link to the next page.
+            if not doc.xpath(f'//a[contains(@hx-get, "?page={page + 1}&")]'):
+                break
+
             page += 1
 
     def parse_vote(self, bill, link, session):
@@ -80,7 +83,14 @@ class KSVoteScraper(Scraper):
                 )
                 break
 
-            except Exception as e:
+            except scrapelib.HTTPError as e:
+                # a 404 or a 5xx scrapelib already retried won't come good
+                self.warning(f"Skipping vote: {e}")
+                return
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as e:
                 self.warning(f"Attempt {attempt + 1}/10 failed for {link}: {e}")
                 time.sleep(10)
 
@@ -100,16 +110,18 @@ class KSVoteScraper(Scraper):
 
         doc = lxml.html.fromstring(text)
 
-        # The motion/short title lives in the vote hero's short-title span.
-        # Older/alternate layouts used a "list-hero-sub" paragraph, so fall
-        # back to that when the primary element is absent.
-        motion_text = doc.xpath(
-            "string(//span[contains(@class,'vote-hero-shorttitle')])"
-        ).strip()
+        # The motion ("Motion to advance to Emergency Final Action failed;")
+        # is the hero's "list-hero-sub" paragraph; the short-title span holds
+        # the bill's title.
+        motion_text = (
+            doc.xpath("string(//p[contains(@class,'list-hero-sub')])")
+            .strip()
+            .rstrip(";")
+        )
 
         if not motion_text:
             motion_text = doc.xpath(
-                "string(//p[contains(@class,'list-hero-sub')])"
+                "string(//span[contains(@class,'vote-hero-shorttitle')])"
             ).strip()
 
         # Fall back to the roll call heading so votes are never emitted with
@@ -189,11 +201,19 @@ class KSVoteScraper(Scraper):
 
         vote = VoteEvent(
             bill=bill,
+            # without it the bill pseudo id's chamber is "legislature", which
+            # matches no KS bill, so the import rejects the vote
+            bill_chamber="upper" if bill and bill.startswith("S") else "lower",
             start_date=vote_date.strftime("%Y-%m-%d"),
             chamber=chamber,
             motion_text=motion_text,
             legislative_session=session,
-            result="pass" if yes_count > no_count else "fail",
+            result=(
+                "fail"
+                if re.search(r"\bfailed\b", motion_text, re.IGNORECASE)
+                or yes_count <= no_count
+                else "pass"
+            ),
             classification="passage",
         )
 

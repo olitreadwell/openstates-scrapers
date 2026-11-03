@@ -3,7 +3,6 @@ from dateutil.parser import ParserError
 import datetime
 import pytz
 import re
-import requests
 import lxml.html
 from openstates.scrape import Scraper, Event
 from utils import LXMLMixin
@@ -22,7 +21,6 @@ class UnknownBillIdPrefixError(BaseException):
 
 
 class NCEventScraper(Scraper, LXMLMixin):
-    verify = False
     _tz = pytz.timezone("US/Eastern")
     bill_id_re = re.compile(r"([A-Z]\w+\s)*([A-Z]\w+\s)([A-Z]\w+\s)(\d+)")
 
@@ -39,9 +37,13 @@ class NCEventScraper(Scraper, LXMLMixin):
             for row in day_row.xpath('.//div[contains(@class, "cal-event row")]'):
                 status = "tentative"
                 # first cal-event-row sometimes contains full date, skip that
-                time = row.xpath(
-                    'div[contains(@class,"col-12 text-left col-sm-3 text-sm-right")]/text()'
-                )[0].strip()
+                time = (
+                    row.xpath(
+                        'div[contains(@class,"col-12 text-left col-sm-3 text-sm-right")]'
+                    )[0]
+                    .text_content()
+                    .strip()
+                )
 
                 event_row = row.xpath(
                     'div[contains(@class,"col-12 col-sm-9 col-md-12 ")]'
@@ -61,15 +63,12 @@ class NCEventScraper(Scraper, LXMLMixin):
                         'span[contains(@class, "text-dark font-weight-bold")]/text()'
                     )[0].strip()
                     chamber = chamber.replace(":", "")
-
-                # sometimes there are unlinked events, usually just press conferences
                 if not event_row.xpath('a[contains(@href,"/Committees/")]'):
                     continue
 
                 com_link = event_row.xpath('a[contains(@href,"/Committees/")]')[0]
                 com_name = com_link.text_content().strip()
                 com_name = f"{chamber} {com_name}".strip()
-
                 com_url = com_link.xpath("@href")[0]
 
                 where = (
@@ -77,7 +76,8 @@ class NCEventScraper(Scraper, LXMLMixin):
                     .text_content()
                     .strip()
                 )
-                where = where.replace("STREAM", "")
+                where = where.replace("STREAM", "").replace("Stream", "")
+                where = where.replace("Ended", "").strip()
 
                 when = f"{date} {time}"
                 try:
@@ -87,7 +87,7 @@ class NCEventScraper(Scraper, LXMLMixin):
                 except (ParserError, ValueError):
                     self.warning(f"Unable to parse {time}, only using day component")
                     when = dateutil.parser.parse(date)
-                    when = self._tz.localize(when).date()
+                    when = self._tz.localize(when)
 
                 if when < self._tz.localize(datetime.datetime.now()):
                     status = "passed"
@@ -127,7 +127,7 @@ class NCEventScraper(Scraper, LXMLMixin):
                             #  but proper prefixes are one of the following:
                             #  {'SJR', 'HB', 'HR', 'SB', 'HJR', 'SR'}
                             bill_url = bill_row.get("href")
-                            bill_resp = requests.get(bill_url)
+                            bill_resp = self.get(bill_url)
                             bill_page = lxml.html.fromstring(bill_resp.content)
                             raw_bill_id = bill_page.xpath(
                                 ".//div[@class='col-12 col-sm-6 h2 text-center order-sm-2']/text()"

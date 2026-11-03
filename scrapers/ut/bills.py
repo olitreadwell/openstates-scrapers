@@ -62,7 +62,7 @@ class UTBillScraper(Scraper, LXMLMixin):
         session_url = "https://le.utah.gov/billlist.jsp?session={}".format(session_slug)
 
         # For some sessions the link doesn't go straight to the bill list
-        doc = self.lxmlize(session_url, headers=headers)
+        doc = self.lxmlize(session_url, headers=headers, verify=False)
 
         # Get all of the show/hide bill list elements
         # in order to get the IDs of the actual bill lists
@@ -100,22 +100,30 @@ class UTBillScraper(Scraper, LXMLMixin):
                     )
 
     def scrape_bill(self, chamber, session, url, session_slug):
-        response = self.get(url, headers=headers)
-        page = lxml.html.fromstring(response.text)
-        page.make_links_absolute(url)
-
-        bill_id = page.cssselect("#breadcrumb li")
-        if len(bill_id) > 0:
-            bill_id = bill_id[-1].text
+        data = page = None
+        if int(session[:4]) >= 2025:
+            # from 2025 the static page is only a shell its JS fills from the
+            # bill JSON, so skip it
+            data = self.get_bill_json(url, session_slug)
+            bill_id = data["billNumberShort"]
+            title = data["shortTitle"].strip()
         else:
-            raise Exception(
-                f"Unexpected bill page content at {url}, truncated content {response.text[:500]}"
-            )
+            response = self.get(url, headers=headers, verify=False)
+            page = lxml.html.fromstring(response.text)
+            page.make_links_absolute(url)
 
-        (header,) = page.xpath(
-            '//h3[@class="heading"]/text() | //h1[@class="heading"]/text()'
-        )
-        title = header.replace(bill_id, "").strip()
+            bill_id = page.cssselect("#breadcrumb li")
+            if len(bill_id) > 0:
+                bill_id = bill_id[-1].text
+            else:
+                raise Exception(
+                    f"Unexpected bill page content at {url}, truncated content {response.text[:500]}"
+                )
+
+            (header,) = page.xpath(
+                '//h3[@class="heading"]/text() | //h1[@class="heading"]/text()'
+            )
+            title = header.replace(bill_id, "").strip()
 
         if ".B. " in bill_id:
             bill_type = "bill"
@@ -140,12 +148,14 @@ class UTBillScraper(Scraper, LXMLMixin):
         )
         bill.add_source(url)
 
-        primary_info = page.xpath('//div[@id="billsponsordiv"]')
+        primary_info = [] if page is None else page.xpath('//div[@id="billsponsordiv"]')
         if len(primary_info) == 0:
             # starting 2025 seems UT is rendering bill data from an API/JSON
             # but prior years seem to have static-ish HTML
             # so we have two logic branches here
-            yield from self.scrape_bill_details_from_api(bill, url, session_slug)
+            if data is None:
+                data = self.get_bill_json(url, session_slug)
+            yield from self.scrape_bill_details_from_api(bill, data, session_slug)
         else:
             yield from self.parse_bill_details_from_html(
                 bill, bill_id, chamber, page, primary_info
@@ -220,7 +230,7 @@ class UTBillScraper(Scraper, LXMLMixin):
             status_table = page.xpath('//div[@id="billStatus"]//table')[0]
             yield from self.parse_status(bill, status_table, chamber)
 
-    def scrape_bill_details_from_api(self, bill: Bill, bill_url, session_slug: str):
+    def get_bill_json(self, bill_url, session_slug):
         # get bill "filename" from bill_url
         bill_filename = bill_url.split("/")[-1].split(".")[0]
         # use datetime to generate a unix epoch timestamp representing now
@@ -230,7 +240,9 @@ class UTBillScraper(Scraper, LXMLMixin):
             f"https://le.utah.gov/data/{session_slug}/{bill_filename}.json?_={now}"
         )
         response = self.get(api_url, verify=False, headers=headers)
-        data = json.loads(response.content)
+        return json.loads(response.content)
+
+    def scrape_bill_details_from_api(self, bill: Bill, data, session_slug: str):
 
         # Sponsorships
         if "primeSponsorName" in data and data["primeSponsorName"]:
@@ -326,32 +338,14 @@ class UTBillScraper(Scraper, LXMLMixin):
         if "actionHistoryList" in data:
             cmte_match_re = re.compile(r"(committee|comm|to rules)", re.IGNORECASE)
             for action_data in data["actionHistoryList"]:
-                categorizer_result = self.categorizer.categorize(
-                    action_data["description"]
+                # "owner" is who holds the bill after the action, so use
+                # actionClass for the acting chamber
+                actor = {"H": "lower", "S": "upper", "G": "executive"}.get(
+                    action_data["actionClass"], "legislature"
                 )
-                actor = "legislature"
-                if action_data["owner"] == "Legislative Research and General Counsel":
-                    actor = "legislature"
-                elif "governor" in action_data["owner"].lower():
-                    actor = "executive"
-                elif "clerk of the house" in action_data["owner"].lower():
-                    actor = "lower"
-                elif "clerk of the senate" in action_data["owner"].lower():
-                    actor = "upper"
-                elif action_data["owner"].startswith("Senate"):
-                    actor = "upper"
-                elif action_data["owner"].startswith("House"):
-                    actor = "lower"
-                # we can also fall back in a few ways
-                # one is to use action description which often starts with House or Senate
-                elif action_data["description"].startswith("Senate"):
-                    actor = "upper"
-                elif action_data["description"].startswith("House"):
-                    actor = "lower"
-                else:
-                    self.warning(
-                        f"Found unexpected actor {action_data['owner']} at {api_url}"
-                    )
+                categorizer_result = self.categorizer.categorize(
+                    re.sub(r"^(House|Senate|LFA)/ ", "", action_data["description"])
+                )
 
                 if ":" in action_data["actionDate"]:
                     date = parser.parse(action_data["actionDate"])

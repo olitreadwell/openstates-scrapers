@@ -18,16 +18,27 @@ class VoteTotalMismatch(Exception):
 
 class MAVoteScraper(Scraper):
     def scrape(self, session=None):
-        yield from HouseJournalDirectory(session=session).do_scrape()
-        yield from SenateJournalDirectory(session=session).do_scrape()
+        speaker = next(
+            (
+                s.get("extras", {}).get("house_speaker")
+                for s in self.jurisdiction.legislative_sessions
+                if s["identifier"] == session
+            ),
+            None,
+        )
+        yield from HouseJournalDirectory(session=session, speaker=speaker).do_scrape(
+            scraper=self
+        )
+        yield from SenateJournalDirectory(session=session).do_scrape(scraper=self)
 
 
 class HouseJournalDirectory(HtmlPage):
     source = URL("https://malegislature.gov/Journal/House/", verify=False)
 
-    def __init__(self, source=None, session=None):
+    def __init__(self, source=None, session=None, speaker=None):
         super().__init__(source=source or self.source)
         self.session = session
+        self.speaker = speaker
 
     def process_page(self):
         # find all links to a file called RollCalls
@@ -36,12 +47,12 @@ class HouseJournalDirectory(HtmlPage):
             x for x in XPath("//a/@href").match(self.root) if x.endswith("RollCalls")
         ]
         for rc in roll_calls:
-            vote_events = HouseRollCall(
-                source=URL(rc, verify=False), session=self.session
-            ).do_scrape()
-            for vote_event in vote_events:
-                vote_event.add_source(self.source.url, note="House journal listing")
-                yield vote_event
+            yield HouseRollCall(
+                source=URL(rc, verify=False),
+                session=self.session,
+                speaker=self.speaker,
+                listing_url=self.source.url,
+            )
 
 
 class SenateJournalDirectory(HtmlListPage):
@@ -56,14 +67,11 @@ class SenateJournalDirectory(HtmlListPage):
         # Find all link to each month
         month_links = XPath("//a[@aria-controls='journalList']/@href").match(self.root)
         for month_link in month_links:
-            vote_events = SenateJournalMonth(
+            yield SenateJournalMonth(
                 source=URL(month_link, verify=False),
                 votes_list=self.votes_list,
                 session=self.session,
-            ).do_scrape()
-            for vote_event in vote_events:
-                # vote_event.add_source(self.source.url, note="Senate jouenal listing")
-                yield vote_event
+            )
 
 
 class SenateJournalMonth(HtmlListPage):
@@ -99,13 +107,7 @@ class SenateJournal(PdfPage):
         f"{motion_and_vote_total}.*?{vote_id}.*?{vote_section}", re.DOTALL
     )
 
-    not_name_re = re.compile(
-        r"^(\d|UNCORRECTED|Joint Rules|\.|Real ID,-- homeless"
-        r"|Pharmacists,-- PrEP\."
-        r"|Brewster,-- land\."
-        r"|Provincetown,-wastewater"
-        r")"
-    )
+    not_name_re = re.compile(r"^(\d|UNCORRECTED|Joint Rules|\.)")
 
     precise_motion = r"question on\s+(.+)\s+was determined"
     precise_motion_re = re.compile(precise_motion, re.DOTALL)
@@ -257,8 +259,6 @@ class SenateJournal(PdfPage):
         #     possible_total_nv = "0"
         # total_nv = int(possible_total_nv)
 
-        # vote_number = match.group("votenumber")
-
         # Get list of voter names for each section
         yea_voters = self.find_names(match.group("yealines"))
         nay_voters = self.find_names(match.group("naylines"))
@@ -324,7 +324,15 @@ class SenateJournal(PdfPage):
             result="pass" if vote_passed else "fail",
             classification=vote_classification,
             bill_chamber=bill_chamber,
+            identifier=match.group("votenumber"),
         )
+
+        vote_event.set_count("yes", total_yea)
+        vote_event.set_count("no", total_nay)
+        for name in yea_voters:
+            vote_event.yes(name)
+        for name in nay_voters:
+            vote_event.no(name)
 
         vote_event.add_source(self.source.url)
 
@@ -332,9 +340,14 @@ class SenateJournal(PdfPage):
 
     # Finds names in text, ignoring some common phrases and empty lines
     def find_names(self, text):
-        text = [x.strip() for x in text.split("\n")]
+        text = [x.strip().rstrip(" -") for x in text.split("\n")]
         text = [x for x in text if x != ""]
-        names = [x for x in text if not self.not_name_re.match(x) and "," in x]
+        # ",-" marks page headers like "Brewster,-- land."
+        names = [
+            x
+            for x in text
+            if not self.not_name_re.match(x) and "," in x and ",-" not in x
+        ]
 
         return names
 
@@ -360,7 +373,18 @@ class HouseVoteRecordParser:
     bill_re = re.compile(r"(h|s)\.? ?(\d+) ?(.*)", re.IGNORECASE)
     number_re = re.compile(r"no\.? ?(\d+)", re.IGNORECASE)
 
-    def __init__(self, vote_text, session=None):
+    # One "<vote letter> <name>" cell of the roll grid in `pdftotext -layout`
+    # output, e.g. "Y   Mr. Speaker" or "N   Tyler *". Each letter is paired
+    # with the name printed beside it. Without -layout, pdftotext emits the
+    # letter columns in a different order than the names, so zipping two
+    # separately collected lists attached votes to the wrong legislators.
+    cell_re = re.compile(
+        r"(?:^|(?<=\s))([YNXP])\s+(\S(?:.*?\S)?)(?=\s{2,}[YNXP]\s|\s*$)"
+    )
+    time_re = re.compile(r"\d{2}/\d{2}/\d{4} \d{1,2}:\d{2} [AP]M")
+
+    def __init__(self, vote_text, session=None, speaker=None):
+        self.speaker = speaker
         self.votes = []
         self.names = []
         self.time = None
@@ -372,75 +396,47 @@ class HouseVoteRecordParser:
         self.motion = None
         self.motion_parts = []
         self.session = session
-        lines = vote_text.split("\n")
         self.raw = vote_text
-        for line in lines:
-            if re.search(r"^[XP]\s", line):
-                sub_lines = line.split(" ")
-                self.read_line(sub_lines[0])
-                self.read_line(sub_lines[1])
-            else:
-                self.read_line(line)
+        for line in vote_text.split("\n"):
+            self.read_line(line)
 
     def read_line(self, line):
-        line = line.strip()
+        stripped = line.strip()
 
         # These lines contain no useful info and are skipped
-        blank = line in ["\x0c", ""]
-        contains_equal = "=" in line
-        yea_and_nay = line == "Yea and Nay"
-        if blank or contains_equal or yea_and_nay:
-            pass
+        if stripped in ["\x0c", ""] or "=" in stripped:
+            return
 
-        # Check for vote number. When the vote number is found, we can be sure
-        # that all the motion text has been read.
-        elif (match := self.number_re.match(line)) is not None:
-            self.vote_number = int(match.group(1))
-            self.motion = " ".join(self.motion_parts)
+        # Header: motion lines, then "Yea and Nay <date time>", then
+        # "No. <n>  <yeas> YEAS  <nays> NAYS  <n/v> N/V" on one line.
+        if self.vote_number is None:
+            if (match := self.time_re.search(stripped)) is not None:
+                when = dt.datetime.strptime(match.group(0), "%m/%d/%Y %I:%M %p")
+                self.time = self.tz.localize(when)
+            elif (match := self.number_re.match(stripped)) is not None:
+                self.vote_number = int(match.group(1))
+                self.motion = " ".join(self.motion_parts)
+                if (bill_match := self.bill_re.match(self.motion)) is not None:
+                    self.bill_id = f"{bill_match.group(1)}{bill_match.group(2)}"
+                if (total := self.total_yea_re.search(stripped)) is not None:
+                    self.total_yea = int(total.group(1))
+                if (total := self.total_nay_re.search(stripped)) is not None:
+                    self.total_nay = int(total.group(1))
+                if (total := self.total_nv_re.search(stripped)) is not None:
+                    self.total_nv = int(total.group(1))
+            else:
+                self.motion_parts.append(stripped)
+            return
 
-            # derive bill_id immediately
-            if (bill_match := self.bill_re.match(self.motion)) is not None:
-                self.bill_id = f"{bill_match.group(1)}{bill_match.group(2)}"
-
-        # Check for time
-        elif ":" in line:
-            when = dt.datetime.strptime(line, "%m/%d/%Y %I:%M %p")
-            when = self.tz.localize(when)
-            self.time = when
-
-        # Check for vote totals
-        elif (match := self.total_yea_re.match(line)) is not None:
-            self.total_yea = int(match.group(1))
-
-        elif (match := self.total_nay_re.match(line)) is not None:
-            self.total_nay = int(match.group(1))
-
-        elif (match := self.total_nv_re.match(line)) is not None:
-            self.total_nv = int(match.group(1))
-        # line is vote type
-        # Y is sometimes read as P by the pdf reader.
-        elif line in ["Y", "N", "X", "P"]:
-            self.votes.append(line)
-
-        # Read the line as motion, motion text may come through as multiple
-        # lines so append the line to an array.
-        elif self.vote_number is None:
-            self.motion_parts.append(line)
-
-        # At this point, the line is assumed to contain a name.
-
-        # Special case where pdf reader mistakenly joins two names together into
-        # a single line. This can happen if the first name starts with a double
-        # '--'. This can cause the next name in the list to be joined with
-        # this line. e.g. "--Jones-Smith" instead of "--Jones--" and "Smith" on
-        # separate lines.
-        elif line.startswith("--"):
-            all_names = [x for x in line[2:].split("-") if x]
-            self.names.extend(all_names)
-
-        # The line is a single name, but may be surrounded by '--'
-        else:
-            self.names.append(line.replace("--", ""))
+        # Roll grid. "*" marks a vote cast after the roll closed, and some
+        # names are printed as "--Name--". Neither mark is part of the name.
+        for vote_val, name in self.cell_re.findall(line):
+            name = name.rstrip(" *").replace("--", "")
+            # The rolls list the presiding officer as "Mr. Speaker"
+            if name == "Mr. Speaker":
+                name = self.speaker or name
+            self.votes.append(vote_val)
+            self.names.append(name)
 
     # Raises an error or writes warning to logger. Returns true if data is valid
     def error_if_invalid(self):
@@ -487,12 +483,15 @@ class HouseVoteRecordParser:
 
         vote.set_count("yes", self.total_yea)
         vote.set_count("no", self.total_nay)
+        vote.set_count("not voting", self.total_nv)
 
         vote_dictionary = {
             "Y": "yes",
-            "P": "yes",  # Y's can be misread as P's
             "N": "no",
             "X": "not voting",
+            # P=PRESENT per the sheet's legend; excluded from its YEAS/NAYS/N/V
+            # totals, so it is not a yes.
+            "P": "other",
         }
 
         # Add all individual votes
@@ -502,9 +501,15 @@ class HouseVoteRecordParser:
 
 
 class HouseRollCall(PdfPage):
-    def __init__(self, source, session=None):
+    # HouseVoteRecordParser pairs each vote letter with the name beside it,
+    # which needs the columns kept in place.
+    preserve_layout = True
+
+    def __init__(self, source, session=None, speaker=None, listing_url=None):
         super().__init__(source=source)
         self.session = session
+        self.speaker = speaker
+        self.listing_url = listing_url
 
     def process_page(self):
         # Each bill vote starts with the same text, so use it as a separator.
@@ -514,11 +519,14 @@ class HouseRollCall(PdfPage):
         vote_text = self.text.split(separator)[1:]
 
         for vote in vote_text:
-            vote_parser = HouseVoteRecordParser(vote, session=self.session)
+            vote_parser = HouseVoteRecordParser(
+                vote, session=self.session, speaker=self.speaker
+            )
             if (warning := vote_parser.get_warning()) is not None:
                 self.logger.warning(warning)
             else:
                 vote_parser.error_if_invalid()
                 vote_event = vote_parser.createVoteEvent()
                 vote_event.add_source(self.source.url, note="Vote record pdf")
+                vote_event.add_source(self.listing_url, note="House journal listing")
                 yield vote_event

@@ -18,7 +18,6 @@ tz = pytz.timezone("America/New_York")
 # FYI: as of 2025 this should be run with --http-resilience
 class PABillScraper(Scraper):
     session_year: str = ""
-    verify = False
 
     def scrape(self, chamber=None, session=None):
         chambers = [chamber] if chamber is not None else ["upper", "lower"]
@@ -42,16 +41,19 @@ class PABillScraper(Scraper):
 
         # PA website repeats some bills on the listing page
         # ex: resolutions that are also concurrent resolutions
-        bill_urls_seen = []
+        bill_urls_seen = set()
 
         RETRY_TIMES = 5
         for link in page.xpath('//a[@class="bill"]'):
+            if link.attrib["href"] in bill_urls_seen:
+                continue
+            bill_urls_seen.add(link.attrib["href"])
             is_parsed = False
             for retry_time in range(0, RETRY_TIMES):
                 try:
-                    if link.attrib["href"] not in bill_urls_seen:
-                        bill_urls_seen.append(link.attrib["href"])
-                        yield from self.parse_bill(chamber, session, special, link)
+                    # collect first so a failed attempt yields nothing
+                    objs = list(self.parse_bill(chamber, session, special, link))
+                    yield from objs
                     is_parsed = True
 
                     break
@@ -126,6 +128,7 @@ class PABillScraper(Scraper):
         yield bill
 
     def parse_bill_versions(self, bill, page):
+        amendment_pages = {}
         for row in page.xpath('//div[@id="section-pn"]/div'):
             printers_number = 0
             for a in row.xpath(
@@ -154,7 +157,9 @@ class PABillScraper(Scraper):
                 if "Amendments" in doc_title:
                     # House and Senate Amendments
                     amend_chamber = doc_title.replace("Amendments", "").strip()
-                    self.scrape_amendments(bill, doc_url, amend_chamber)
+                    self.scrape_amendments(
+                        bill, doc_url, amend_chamber, amendment_pages
+                    )
                 elif "Fiscal Note" in doc_title:
                     # Senate & House Fiscal Notes
                     mimetype = self.mimetype_from_class(a)
@@ -174,8 +179,10 @@ class PABillScraper(Scraper):
                         on_duplicate="ignore",
                     )
 
-    def scrape_amendments(self, bill, link, chamber_pretty):
-        page = self.get_page(link)
+    def scrape_amendments(self, bill, link, chamber_pretty, pages):
+        if link not in pages:
+            pages[link] = self.get_page(link)
+        page = pages[link]
 
         for row in page.xpath('//div[contains(@class, "card shadow")]'):
             version_name = "".join(
@@ -184,12 +191,13 @@ class PABillScraper(Scraper):
                 )
             ).strip()
             version_name = "{} Amendment {}".format(chamber_pretty, version_name)
-            for a in row.xpath('.//div[contains(@class, "position-md-absolute")]//a'):
+            for a in row.xpath('.//div[contains(@class, "position-lg-absolute")]//a'):
                 mimetype = self.mimetype_from_class(a)
                 version_link = a.attrib["href"]
                 bill.add_version_link(
                     version_name,
                     version_link,
+                    classification="amendment",
                     media_type=mimetype,
                     on_duplicate="ignore",
                 )
@@ -206,12 +214,13 @@ class PABillScraper(Scraper):
         )
         primary_sponsors = page.xpath(xpath)
         for sponsor in primary_sponsors:
-            sponsor = utils.clean_sponsor_name(sponsor.text_content())
+            raw_name = sponsor.text_content()
+            sponsor = utils.clean_sponsor_name(raw_name)
             if sponsor:
                 bill.add_sponsorship(
                     sponsor,
                     classification="primary",
-                    chamber=utils.get_sponsor_chamber(sponsor),
+                    chamber=utils.get_sponsor_chamber(raw_name),
                     primary=True,
                     entity_type="person",
                 )
@@ -223,12 +232,13 @@ class PABillScraper(Scraper):
         )
         co_sponsors = page.xpath(xpath)
         for sponsor in co_sponsors:
-            sponsor = utils.clean_sponsor_name(sponsor.text_content())
+            raw_name = sponsor.text_content()
+            sponsor = utils.clean_sponsor_name(raw_name)
             if sponsor:
                 bill.add_sponsorship(
                     sponsor,
                     classification="cosponsor",
-                    chamber=utils.get_sponsor_chamber(sponsor),
+                    chamber=utils.get_sponsor_chamber(raw_name),
                     primary=False,
                     entity_type="person",
                 )
@@ -236,12 +246,13 @@ class PABillScraper(Scraper):
         xpath = '//div[@id="coSponsAdd"]//strong'
         co_sponsors = page.xpath(xpath)
         for sponsor in co_sponsors:
-            sponsor = utils.clean_sponsor_name(sponsor.text_content())
+            raw_name = sponsor.text_content()
+            sponsor = utils.clean_sponsor_name(raw_name)
             if sponsor:
                 bill.add_sponsorship(
                     sponsor,
                     classification="cosponsor",
-                    chamber=utils.get_sponsor_chamber(sponsor),
+                    chamber=utils.get_sponsor_chamber(raw_name),
                     primary=False,
                     entity_type="person",
                 )
@@ -361,7 +372,7 @@ class PABillScraper(Scraper):
         if lve_elements:
             other += int(lve_elements[0].text_content())
         nv_elements = page.xpath(
-            '//div[@id="voteSummary"]//div[contains(., " No Vote")]/div[2]'
+            '//div[@id="voteSummary"]//div[contains(., "No Vote")]/div[2]'
         )
         if nv_elements:
             other += int(nv_elements[0].text_content())
@@ -378,6 +389,9 @@ class PABillScraper(Scraper):
         # multiple bills see:
         # so we toss the bill id onto the end of the URL
         vote.dedupe_key = url + "#" + bill.identifier
+        rc_number = self.url_param(url, "rcnum")
+        if rc_number:
+            vote.identifier = "RC#%s" % rc_number
         vote.add_source(url)
         vote.set_count("yes", yeas)
         vote.set_count("no", nays)
@@ -431,6 +445,14 @@ class PABillScraper(Scraper):
             'string(//div[contains(text(), "Type of Motion")]/following-sibling::div[1])'
         ).strip()
         motion = "Committee vote (%s): %s" % (committee, motion)
+        # Several amendments can be voted on at one meeting; the amendment
+        # number (e.g. "HB 1924 PN 2398 A01909") tells them apart
+        bill_info = doc.xpath(
+            'string(//div[contains(@class, "detailsLabel")][contains(., "Bill/Resolution")]/following-sibling::div)'
+        )
+        amendment = re.search(r"\bA\d+\b", bill_info)
+        if amendment:
+            motion = "%s %s" % (motion, amendment.group(0))
 
         # Roll call
         rollcall = self.parse_upper_committee_vote_rollcall(doc)
@@ -444,6 +466,11 @@ class PABillScraper(Scraper):
             bill=bill,
         )
         vote.dedupe_key = url + "#" + bill.identifier
+        # Roll calls at one meeting can share motion, date and roll;
+        # PA's roll call id tells them apart
+        rollcall_id = self.url_param(url, "rollcallid")
+        if rollcall_id:
+            vote.identifier = "RCS#%s" % rollcall_id
         vote.set_count("yes", rollcall["yes_count"])
         vote.set_count("no", rollcall["no_count"])
         vote.set_count("other", rollcall["other_count"])
@@ -510,6 +537,12 @@ class PABillScraper(Scraper):
             if cls in mimetypes:
                 mimetype = mimetypes[cls]
                 return mimetype
+
+    def url_param(self, url, name):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        for key, values in query.items():
+            if key.lower() == name:
+                return values[0]
 
     def fix_url_domain(self, url):
         # Some vote urls have the old domain in the new website

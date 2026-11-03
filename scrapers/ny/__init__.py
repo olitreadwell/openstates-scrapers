@@ -1,5 +1,6 @@
 import os
 import requests
+import scrapelib
 
 from datetime import datetime
 from openstates.scrape import State
@@ -50,6 +51,7 @@ class NewYork(State):
             "name": "2017 Regular Session",
             "start_date": "2017-01-04",
             "end_date": "2018-12-31",
+            "extras": {"assembly_speaker": "Heastie"},
         },
         {
             "_scraped_name": "2019",
@@ -57,6 +59,7 @@ class NewYork(State):
             "name": "2019 Regular Session",
             "start_date": "2019-01-09",
             "end_date": "2020-01-08",
+            "extras": {"assembly_speaker": "Heastie"},
         },
         {
             "_scraped_name": "2021",
@@ -65,6 +68,7 @@ class NewYork(State):
             "start_date": "2021-01-06",
             "end_date": "2022-06-10",
             "active": False,
+            "extras": {"assembly_speaker": "Heastie"},
         },
         {
             "_scraped_name": "2023",
@@ -73,6 +77,7 @@ class NewYork(State):
             "start_date": "2023-01-04",
             "end_date": "2024-06-06",
             "active": False,
+            "extras": {"assembly_speaker": "Heastie"},
         },
         {
             "_scraped_name": "2025",
@@ -81,6 +86,7 @@ class NewYork(State):
             "start_date": "2025-01-08",
             "end_date": "2026-12-31",
             "active": True,
+            "extras": {"assembly_speaker": "Heastie"},
         },
     ]
     ignored_scraped_sessions = []
@@ -91,11 +97,18 @@ class NewYork(State):
         end_year = current_year if current_year % 2 == 1 else current_year + 1
 
         listed_sessions = []
-        api_key = os.environ["NEW_YORK_API_KEY"]
+        params = {"key": os.environ["NEW_YORK_API_KEY"]}
+        scraper = scrapelib.Scraper(raise_errors=False)
         for start_year in range(2007, end_year + 1, 2):
-            response = requests.get(
-                f"https://legislation.nysenate.gov/api/3/bills/{start_year}?limit=1&offset=1&full=True&sort=&key={api_key}"
-            )
+            try:
+                response = scraper.get(
+                    f"https://legislation.nysenate.gov/api/3/bills/{start_year}?limit=1&offset=1&full=True&sort=",
+                    params=params,
+                    timeout=60,
+                )
+            except requests.RequestException as e:
+                # error messages include the full URL, key and all
+                raise RuntimeError(str(e).replace(params["key"], "<key>")) from None
             if response.status_code == 200:
                 data = response.json()["result"]["items"]
                 if len(data) >= 1:

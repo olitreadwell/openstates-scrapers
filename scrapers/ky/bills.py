@@ -10,11 +10,6 @@ from openstates.utils import convert_pdf
 from utils import LXMLMixin
 from utils.media import get_media_type
 
-import pytz
-import math
-
-central = pytz.timezone("US/Central")
-
 
 def chamber_abbr(chamber):
     if chamber == "upper":
@@ -32,8 +27,6 @@ class KYBillScraper(Scraper, LXMLMixin):
     _subjects = defaultdict(list)
     _is_post_2016 = False
 
-    verify = False
-
     _action_classifiers = [
         ("introduced in", "introduction"),
         ("signed by Governor", ["executive-signature"]),
@@ -46,7 +39,7 @@ class KYBillScraper(Scraper, LXMLMixin):
         ("1st reading", "reading-1"),
         ("2nd reading", "reading-2"),
         ("3rd reading", "reading-3"),
-        ("passed", "passage"),
+        (r"passed \d", "passage"),
         (r"bill passed", "passage"),
         ("line items vetoed", "executive-veto-line-item"),
         ("delivered to secretary of state", "became-law"),
@@ -131,6 +124,7 @@ class KYBillScraper(Scraper, LXMLMixin):
         action_rows = page.xpath(
             '//div[preceding-sibling::a[@id="actions"]][1]/table[1]/tbody/tr'
         )
+        current_chamber = chamber
         for row in action_rows:
             action_date = row.xpath("th[1]/text()")[0].strip()
 
@@ -150,12 +144,17 @@ class KYBillScraper(Scraper, LXMLMixin):
 
             for action_text in action_texts:
                 action_text = action_text.strip()
+                received = re.match(r"received in (House|Senate)", action_text)
+                if received:
+                    current_chamber = (
+                        "lower" if received.group(1) == "House" else "upper"
+                    )
                 if action_text.endswith("House") or action_text.endswith("(H)"):
                     actor = "lower"
                 elif action_text.endswith("Senate") or action_text.endswith("(S)"):
                     actor = "upper"
                 else:
-                    actor = chamber
+                    actor = current_chamber
 
                 classifications = self.classify_action(action_text)
                 bill.add_action(
@@ -226,16 +225,20 @@ class KYBillScraper(Scraper, LXMLMixin):
 
             bill.add_document_link("Fiscal Note", source_url, media_type=mimetype)
 
-        # only grab links in the first table, because proposed amendments have sponsors that are not bill sponsors.
-        for link in page.xpath(
-            "//div[contains(@class,'bill-table')][1]//td/span/a[contains(@href, 'Legislator-Profile')]"
+        # Grab sponsors from the first bill-table only (excludes proposed amendment sponsors).
+        # The website previously linked sponsor names via <a href="...Legislator-Profile...">,
+        # but now renders them as plain <span> elements under a "Sponsors" row.
+        for span in page.xpath(
+            '//div[contains(@class,"bill-table")][1]//tr[th[text()="Sponsors"]]/td/span'
         ):
-            bill.add_sponsorship(
-                link.text.strip(),
-                classification="primary",
-                entity_type="person",
-                primary=True,
-            )
+            name = span.text_content().strip().rstrip(",").strip()
+            if name:
+                bill.add_sponsorship(
+                    name,
+                    classification="primary",
+                    entity_type="person",
+                    primary=True,
+                )
 
         if page.xpath("//th[contains(text(),'Votes')]"):
             vote_url = page.xpath("//a[contains(text(),'Vote History')]/@href")[0]
@@ -307,9 +310,14 @@ class KYBillScraper(Scraper, LXMLMixin):
         os.remove(filename)
 
         vote_date = 0
+        vote_chamber = chamber
         voters = defaultdict(list)
         for x in range(len(pdflines)):
             line = pdflines[x]
+            if line.strip() == "House of Representatives":
+                vote_chamber = "lower"
+            elif line.strip() == "COMMONWEALTH OF KENTUCKY SENATE":
+                vote_chamber = "upper"
             if re.search(r"(\d+/\d+/\d+)", line):
                 initial_date = line.strip()
             if ("AM" in line) or ("PM" in line):
@@ -323,7 +331,7 @@ class KYBillScraper(Scraper, LXMLMixin):
                             time = "".join(time)
                         dt = initial_date + " " + time
                         dt = datetime.strptime(dt, "%m/%d/%Y %I:%M:%S%p")
-                        vote_date = central.localize(dt)
+                        vote_date = self._TZ.localize(dt)
                         vote_date = vote_date.isoformat()
                         # In rare case that no motion is provided
                         if len(motion) < 1:
@@ -367,35 +375,36 @@ class KYBillScraper(Scraper, LXMLMixin):
 
             if line and ("ABSTAINED :" in line or "PASSES :" in line):
                 y = 2
-                next_line = 0
-                next_line = pdflines[x + y]
-                while "NOT VOTING :" not in next_line:
-                    next_line = next_line.split("  ")
-                    if next_line and (
-                        "ABSTAINED" not in next_line or "PASSES" not in next_line
-                    ):
-                        for v in next_line:
-                            if v:
-                                voters["abstain"].append(v.strip())
-                    next_line = pdflines[x + y]
+                while (x + y) < len(pdflines) and "NOT VOTING :" not in pdflines[x + y]:
+                    for v in pdflines[x + y].split("  "):
+                        if v.strip():
+                            voters["abstain"].append(v.strip())
                     y += 1
 
             if line and "NOT VOTING : " in line:
-                lines_to_go_through = math.ceil(not_voting / len(line.split()))
-                next_line = pdflines[x]
-                for y in range(lines_to_go_through):
-                    if len(pdflines) > (x + y + 2):
-                        next_line = pdflines[x + y + 2].split("  ")
-                        for v in next_line:
-                            if v:
-                                voters["not voting"].append(v.strip())
+                # Collect names until we've gathered `not_voting` of them, or hit the
+                # natural end of the section (a blank line, or end of the PDF text).
+                # We can't key off a trailing header like the YEAS/NAYS/ABSTAINED
+                # sections do, since NOT VOTING is the last section and is simply
+                # followed by the next page/vote (or EOF).
+                y = 2  # skip the "NOT VOTING : N" header line and the blank line after it
+                while len(voters["not voting"]) < not_voting and (x + y) < len(
+                    pdflines
+                ):
+                    next_line = pdflines[x + y]
+                    if not next_line.strip():
+                        break
+                    for v in next_line.split("  "):
+                        if v.strip() and len(voters["not voting"]) < not_voting:
+                            voters["not voting"].append(v.strip())
+                    y += 1
                 if yeas > (nays + abstained + not_voting):
                     passed = True
                 else:
                     passed = False
 
                 ve = VoteEvent(
-                    chamber=chamber,
+                    chamber=vote_chamber,
                     start_date=vote_date,
                     motion_text=motion,
                     result="pass" if passed else "fail",

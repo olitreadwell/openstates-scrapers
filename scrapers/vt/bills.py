@@ -35,6 +35,19 @@ class VTBillScraper(Scraper, LXMLMixin):
         resolutions_json = self.get(resolutions_url, verify=False).text
         bills.extend(json.loads(resolutions_json)["data"] or [])
 
+        # Roll calls only give "Surname of Town", so look up full names by PersonID;
+        # drop quoted nicknames (James "Jim" Casey) to match sponsor names
+        people_url = "http://legislature.vermont.gov/people/loadAll/{}".format(
+            year_slug
+        )
+        people = json.loads(self.get(people_url, verify=False).text)["data"] or []
+        full_names = {
+            p["PersonID"]: " ".join(
+                re.sub(r'"[^"]*"', "", p["FirstName"] + " " + p["LastName"]).split()
+            )
+            for p in people
+        }
+
         # Parse the information from each bill
         for info in bills:
             # Strip whitespace from strings
@@ -186,16 +199,20 @@ class VTBillScraper(Scraper, LXMLMixin):
             actions_json = self.get(actions_url, verify=False)
 
             # Checks if page actually has json posted
+            these_actions = []
             if "json" in actions_json.headers.get("Content-Type"):
-                these_actions = json.loads(actions_json.text)["data"]
-                # Checks to see if any data is actually there
-                if these_actions == "":
-                    continue
+                these_actions = json.loads(actions_json.text)["data"] or []
+                bill.add_source(actions_url)
             else:
+                # likely an error page: skip rather than save the bill with no
+                # actions, which would wipe its stored actions on import
+                self.warning(
+                    "Skipping {}: actions response is not JSON".format(
+                        info["BillNumber"]
+                    )
+                )
                 continue
-            bill.add_source(actions_url)
 
-            chambers_passed = set()
             for action in these_actions:
                 action = {k: v for k, v in action.items() if v is not None}
 
@@ -213,6 +230,11 @@ class VTBillScraper(Scraper, LXMLMixin):
                     action["FullStatus"].lower()
                 )
 
+                passed = actor in ("lower", "upper") and any(
+                    x.strip().lower().startswith("aspassed")
+                    for x in action.get("keywords", "").split(";")
+                )
+
                 # If both an action type and actor were assigned
                 if action_classification:
                     action_type = action_classification
@@ -220,23 +242,16 @@ class VTBillScraper(Scraper, LXMLMixin):
                     # if len(action_classification) > 1:
                     # actor = action_classification[1]
 
+                    # third readings are classified above, but also mark passage
+                    if passed and "reading-3" in action_type:
+                        action_type.append("passage")
+
                 # More action categorization
                 # These classifications are done separately because they require more rules
                 # in order to correctly classify
 
-                elif actor == "lower" and any(
-                    x.lower().startswith("aspassed")
-                    for x in action["keywords"].split(";")
-                ):
+                elif passed:
                     action_type = "passage"
-                    chambers_passed.add("H")
-                elif actor == "upper" and any(
-                    x.lower().startswith(" aspassed")
-                    or x.lower().startswith("aspassed")
-                    for x in action["keywords"].split(";")
-                ):
-                    action_type = "passage"
-                    chambers_passed.add("S")
 
                 elif (
                     "favorable report" in action["FullStatus"].lower()
@@ -294,19 +309,17 @@ class VTBillScraper(Scraper, LXMLMixin):
                 )
 
             # Capture votes
+            # roll calls are the actions that have a VoteHeaderID
             votes_url = (
                 "http://legislature.vermont.gov/bill/loadBillRollCalls/{0}/{1}".format(
                     year_slug, internal_bill_id
                 )
             )
-            votes_json = self.get(
-                votes_url,
-                verify=False,
-            ).text
-            votes = json.loads(votes_json)["data"]
             bill.add_source(votes_url)
 
-            for vote in votes:
+            for vote in these_actions:
+                if not vote.get("VoteHeaderID"):
+                    continue
                 roll_call_id = vote["VoteHeaderID"]
                 roll_call_url = (
                     "http://legislature.vermont.gov/bill/"
@@ -319,8 +332,10 @@ class VTBillScraper(Scraper, LXMLMixin):
                 roll_call_nay = []
                 roll_call_not_voting = []
                 for member in roll_call:
-                    (member_name, _district) = member["MemberName"].split(" of ")
-                    member_name = member_name.strip()
+                    member_name = full_names.get(
+                        member["PersonID"],
+                        member["MemberName"].split(" of ")[0].strip(),
+                    )
 
                     if member["MemberVote"] == "Yea":
                         roll_call_yea.append(member_name)
@@ -401,9 +416,7 @@ class VTBillScraper(Scraper, LXMLMixin):
                     year_slug, bill_id_original_format
                 )
             )
-            page = self.lxmlize(conferees_doc_link_url, verify=False)
-            no_data = page.xpath('//div[@class="no-data"]/text()')
-            if not no_data:
+            if doc.xpath('//div[@id="conference-members"]//li'):
                 bill.add_document_link(
                     note="Conference Committee Members",
                     url=conferees_doc_link_url,

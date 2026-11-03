@@ -1,10 +1,8 @@
 import datetime
 import logging
 import re
-import time
 import typing
 from collections import defaultdict
-from http.client import RemoteDisconnected
 from urllib.error import URLError
 from urllib.parse import urlencode
 
@@ -16,13 +14,7 @@ from requests.exceptions import ConnectionError, Timeout, RequestException
 from spatula import HtmlPage, HtmlListPage, XPath, SelectorError, PdfPage, URL
 
 from .actions import Categorizer
-from .utils import (
-    get_random_user_agent,
-    add_random_delay,
-    retry_on_connection_error,
-)
-
-# from https://stackoverflow.com/questions/38015537/python-requests-exceptions-sslerror-dh-key-too-small
+from .utils import get_random_user_agent
 
 SPONSOR_RE = re.compile(
     r"by\s+(?P<sponsors>[^(]+)(\(CO-INTRODUCERS\)\s+(?P<cosponsors>[\s\S]+))?"
@@ -48,7 +40,6 @@ FL_ORGANIZATION_ENTITY_NAME_KEYWORDS = [
 ]
 
 requests.packages.urllib3.disable_warnings()
-requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS += ":HIGH:!DH:!aNULL"
 
 # Patch the URL class to handle connection errors more gracefully
 original_get_response = URL.get_response
@@ -58,12 +49,12 @@ def patched_get_response(self, scraper):
     """
     Patch the URL.get_response method to add retry logic for connection errors.
     """
+    # spatula/scrapelib default to no timeout, so a stalled connection
+    # (seen on flhouse.gov) hangs the whole scrape instead of being retried
+    if self.timeout is None:
+        self.timeout = 60
 
-    # Use our handle_remote_disconnected function to specifically handle RemoteDisconnected errors
     def get_response_with_retry():
-        # Add a small random delay before each request
-        add_random_delay(0.5, 2)
-
         try:
             return original_get_response(self, scraper)
         except (ConnectionError, URLError, Timeout, RequestException) as e:
@@ -77,19 +68,16 @@ def patched_get_response(self, scraper):
 
             raise
 
-    # First, handle RemoteDisconnected errors specifically
-    from .utils import handle_remote_disconnected
-
-    # Then, handle other connection errors
     from .utils import retry_on_connection_error
 
     return retry_on_connection_error(
-        lambda: handle_remote_disconnected(
-            get_response_with_retry, max_retries=5, initial_backoff=10, max_backoff=120
-        ),
-        max_retries=3,
-        initial_backoff=5,
-        max_backoff=60,
+        get_response_with_retry,
+        # a full session takes hours, so ride out a short outage on the state's
+        # sites (both have gone 500/503 for minutes at a time) instead of
+        # ending the run
+        max_retries=6,
+        initial_backoff=30,
+        max_backoff=600,
     )
 
 
@@ -119,15 +107,44 @@ class SubjectPDF(PdfPage):
         if a line contains (H|S)(\\d+) that bill gets current subject
         """
         subjects = defaultdict(set)
-        SUBJ_RE = re.compile("^[A-Z ,()]+$")
+        SUBJ_RE = re.compile(r"^[A-Z(][A-Z0-9 ,;()/'-]+$")
         BILL_RE = re.compile(r"[HS]\d+(?:-[A-Z])?")
+        # repeated on every page
+        PAGE_LINES = {"FLORIDA LEGISLATURE", "SUBJECT INDEX", "CONTINUED ON NEXT PAGE"}
+
+        def is_heading(line):
+            return (
+                SUBJ_RE.match(line)
+                and not BILL_RE.search(line)
+                and line not in PAGE_LINES
+            )
+
+        lines = [
+            line.strip().removesuffix(" (Cont.)") for line in self.text.splitlines()
+        ]
+        # Long headings wrap onto a second line, and where pdftotext interleaves
+        # two columns the halves are apart. Each heading is also listed whole,
+        # so map a first half to the whole heading and skip a second half.
+        headings = {line for line in lines if is_heading(line)}
+        halves = {}
+        for h in headings:
+            for i, c in enumerate(h):
+                if c == " " and h[:i] in headings and h[i + 1 :] in headings:
+                    halves[h[:i]] = h
+                    halves[h[i + 1 :]] = None
 
         subject = None
-
-        for line in self.text.splitlines():
-            if SUBJ_RE.match(line):
-                subject = line.lower().strip()
-            elif subject and BILL_RE.findall(line):
+        heading = None
+        for line in lines:
+            if is_heading(line):
+                heading = f"{heading} {line}" if heading else line
+                name = halves.get(heading, heading)
+                # a lone "(VETOED)" or "(ADOPTED)" ends a wrapped bill line
+                if name and not name.startswith("("):
+                    subject = name.lower()
+                continue
+            heading = None
+            if subject:
                 for bill in BILL_RE.findall(line):
                     # normalize bill id to [SH]#
                     bill = bill.replace("-", "")
@@ -139,7 +156,6 @@ class SubjectPDF(PdfPage):
 class BillList(HtmlListPage):
     selector = XPath("//th/a[contains(@href, '/Session/Bill/')]")
     next_page_selector = XPath("//a[@class='next']/@href")
-    dependencies = {"subjects": SubjectPDF}
 
     def get_source_from_input(self):
         # to test scrape an individual bill, add &billNumber=1351
@@ -193,7 +209,7 @@ class BillList(HtmlListPage):
 
         # normalize id from HB 0004 to H4
         subj_bill_id = re.sub(r"(H|S)\w+ 0*(\d+)", r"\1\2", bill_id)
-        bill.subject = list(self.subjects[subj_bill_id])
+        bill.subject = list(self.input["subjects"][subj_bill_id])
 
         return BillDetail(bill)
 
@@ -209,6 +225,14 @@ class BillDetail(HtmlPage):
 
     def get_source_from_input(self):
         return URL(self.input.sources[0]["url"], verify=False)
+
+    def _to_items(self, scraper, **kwargs):
+        # spatula fetches this page and its vote pages inside the BillList
+        # generator, so an error here would end the whole session's scrape
+        try:
+            yield from super()._to_items(scraper, **kwargs)
+        except Exception as e:
+            self.logger.error(f"Skipping rest of {self.input.identifier}: {e!r}")
 
     def process_page(self):
         if self.root.xpath("//div[@id = 'tabBodyBillHistory']//table"):
@@ -446,7 +470,7 @@ class BillDetail(HtmlPage):
                     vote_date = tr.xpath("string(td[2])").strip()
                 try:
                     vote_date = datetime.datetime.strptime(
-                        vote_date, "%m/%d/%Y %H:%M %p"
+                        vote_date, "%m/%d/%Y %I:%M %p"
                     )
                 except ValueError:
                     self.logger.logger.warning("bad vote date: {}".format(vote_date))
@@ -580,7 +604,7 @@ class FloorVote(PdfPage):
             for line in lines[VOTE_START_INDEX:]:
                 if not line.strip():
                     break
-                for member in re.findall(r"\s{8,}([A-Z][a-z\'].*?)-\d{1,3}", line):
+                for member in re.findall(r"\s{8,}([A-Z][a-zà-ÿ\'].*?)-\d{1,3}", line):
                     member = member.strip()
                     vote.vote("not voting", member)
         yield vote
@@ -678,11 +702,9 @@ class UpperComVote(PdfPage):
         # set voters
         for vtype, voters in votes.items():
             for voter in voters:
-                voter = voter.strip()
                 # Removes the few voter names with a ton of extra spaces with  VA at the end.
                 # Ex: Cruz                                                               VA
-                if "  VA" in voter:
-                    voter = " ".join(voter.split()[:-2])
+                voter = re.split(r"\s{2,}", voter.strip())[0]
                 if len(voter) > 0:
                     vote.vote(vtype, voter)
 
@@ -715,7 +737,57 @@ class _FLHouseWAFSource(URL):
         return super().get_response(scraper)
 
 
-class HouseSearchPage(HtmlListPage):
+# The WAF rejects the default scrapelib User-Agent, and rotating the header
+# mid-run looks like a hijacked session, so every flhouse.gov request sends the
+# same browser headers.
+FLHOUSE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+
+class _FLHousePage:
+    """Shared flhouse.gov handling for the search, bill and vote pages.
+
+    The whole site sits behind the same WAF, so the bill detail and committee
+    vote pages need the same fresh WAF session and the same block-page check as
+    the search page. Without them a blocked page is a plain HTTP 200 whose
+    markup holds no vote links and no vote totals, so the scrape quietly drops
+    House committee votes instead of retrying.
+    """
+
+    @staticmethod
+    def house_source(url):
+        return _FLHouseWAFSource(url, headers=FLHOUSE_HEADERS, retries=3, verify=False)
+
+    def accept_response(self, response: requests.Response):
+        # Check if the page response is an annoying 404 error message in the HTML
+        # which sometimes happens despite a 200 HTTP code response
+        # which looks like:
+        # <div class="page-404">
+        # We're Sorry, the page you requested can not <br/> be located within FLHouse.gov
+        page = lxml.html.fromstring(response.content)
+        # also can be a "request rejected" page that looks like
+        # <html><head><title>Request Rejected</title></head>
+        text_not_found_msg = page.xpath("//div[@class='page-404']")
+        request_rejected_msg = page.xpath(
+            "//title[contains(text(), 'Request Rejected')]"
+        )
+        if len(text_not_found_msg) > 0:
+            self.logger.info(
+                f"Encountered text-based Not Found message at {response.url}"
+            )
+            return False
+        elif len(request_rejected_msg) > 0:
+            self.logger.info(
+                f"Encountered text-based Rejected message at {response.url}"
+            )
+            return False
+        else:
+            return True
+
+
+class HouseSearchPage(_FLHousePage, HtmlListPage):
     """
     House committee roll calls are not available on the Senate's
     website. Furthermore, the House uses an internal ID system in
@@ -747,47 +819,10 @@ class HouseSearchPage(HtmlListPage):
             ) from e
 
         form = {"Chamber": "B", "SessionId": session_number, "BillNumber": bill_number}
-        return _FLHouseWAFSource(
-            url + "?" + urlencode(form),
-            method="GET",
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "Host": "flhouse.gov",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            },
-            retries=3,
-            verify=False,
-        )
-
-    def accept_response(self, response: requests.Response):
-        # Check if the page response is an annoying 404 error message in the HTML
-        # which sometimes happens despite a 200 HTTP code response
-        # which looks like:
-        # <div class="page-404">
-        # We're Sorry, the page you requested can not <br/> be located within FLHouse.gov
-        page = lxml.html.fromstring(response.content)
-        # also can be a "request rejected" page that looks like
-        # <html><head><title>Request Rejected</title></head>
-        text_not_found_msg = page.xpath("//div[@class='page-404']")
-        request_rejected_msg = page.xpath(
-            "//title[contains(text(), 'Request Rejected')]"
-        )
-        if len(text_not_found_msg) > 0:
-            self.logger.info(
-                f"Encountered text-based Not Found message at {response.url}"
-            )
-            return False
-        elif len(request_rejected_msg) > 0:
-            self.logger.info(
-                f"Encountered text-based Rejected message at {response.url}"
-            )
-            return False
-        else:
-            return True
+        return self.house_source(url + "?" + urlencode(form))
 
     def process_item(self, item):
-        source = URL(f"{item}", verify=False)
-        return HouseBillPage(self.input, source=source)
+        return HouseBillPage(self.input, source=self.house_source(f"{item}"))
 
     # Override so that we can handle occasional bill that does not show up in search
     # by catching SelectorError
@@ -804,7 +839,7 @@ class HouseSearchPage(HtmlListPage):
             )
 
 
-class HouseBillPage(HtmlListPage):
+class HouseBillPage(_FLHousePage, HtmlListPage):
     selector = XPath('//a[text()="See Votes"]/@href', min_items=0)
     example_input = Bill(
         "HB 1", "2020", "title", chamber="upper", classification="bill"
@@ -814,11 +849,10 @@ class HouseBillPage(HtmlListPage):
     )
 
     def process_item(self, item):
-        source = URL(f"{item}", verify=False)
-        return HouseComVote(self.input, source=source)
+        return HouseComVote(self.input, source=self.house_source(f"{item}"))
 
 
-class HouseComVote(HtmlPage):
+class HouseComVote(_FLHousePage, HtmlPage):
     example_input = Bill(
         "HB 1", "2020", "title", chamber="upper", classification="bill"
     )
@@ -873,29 +907,30 @@ class HouseComVote(HtmlPage):
             vote.set_count("not voting", other_count)
 
             for member_vote in self.root.xpath(
-                '//ul[contains(@class, "vote-list")]/li'
+                '//div[contains(@class, "vote-list")]/div[@role="row"]'
+                '[not(contains(@class, "sr-only"))]'
             ):
-                if not member_vote.text_content().strip():
-                    continue
-
                 (member,) = member_vote.xpath("span[2]//text()")
-                (member_vote,) = member_vote.xpath("span[1]//text()")
+                (member_vote,) = member_vote.xpath(
+                    'span[1]/span[@aria-hidden="true"]/text()'
+                )
 
                 member = member.strip()
+                member_vote = member_vote.strip()
                 if member_vote == "Y":
                     vote.yes(member)
                 elif member_vote == "N":
                     vote.no(member)
-                elif member_vote == "-":
+                # Parenthetical votes are shown as "Did Not Vote" and are
+                # counted in Total Missed, same as "-"
+                elif member_vote == "-" or re.search(r"\([YN]\)", member_vote):
                     vote.vote("not voting", member)
-                # Parenthetical votes appear to not be counted in the
-                # totals for Yea, Nay, _or_ Missed
-                elif re.search(r"\([YN]\)", member_vote):
-                    continue
                 else:
                     raise ValueError("Unknown vote type found: {}".format(member_vote))
 
             return vote
+        else:
+            self.logger.warning(f"No vote totals on {self.source.url}")
 
 
 class FlBillScraper(Scraper):
@@ -914,122 +949,26 @@ class FlBillScraper(Scraper):
         )
 
     def scrape(self, session=None):
-        self.raise_errors = False
-        self.retry_attempts = 5
-        self.retry_wait_seconds = 5
+        # patched_get_response already retries every spatula request
+        self.retry_attempts = 0
         house_session_number = self.get_house_session_number(session)
 
-        # Set up a circuit breaker to track consecutive failures
-        self._consecutive_failures = 0
-        self._max_consecutive_failures = 3
-        self._circuit_breaker_timeout = 120  # 2 minutes
-
         self.headers["User-Agent"] = get_random_user_agent()
-
-        # Set up connection pool reset
-        self._last_reset_time = time.time()
-        self._reset_interval = 600  # Reset connection pool every 10 minutes
-
-        # Create a fresh session
-        self._create_fresh_session()
 
         # spatula's logging is better than scrapelib's
         logging.getLogger("scrapelib").setLevel(logging.WARNING)
 
-        def do_scrape_with_retry():
-            bill_list = BillList(
-                {"session": session, "house_session_number": house_session_number}
-            )
-            yield from self._process_bill_list(bill_list)
+        subjects = next(iter(SubjectPDF({"session": session}).do_scrape(scraper=self)))
 
-        yield from retry_on_connection_error(
-            lambda: list(do_scrape_with_retry()),
-            max_retries=3,
-            initial_backoff=10,
-            max_backoff=120,
+        # Yield bills as they are scraped: individual requests are already
+        # retried in patched_get_response, and buffering the whole session in a
+        # list() meant one exhausted request threw away hours of collected bills
+        # and started the session over from the first bill.
+        bill_list = BillList(
+            {
+                "session": session,
+                "house_session_number": house_session_number,
+                "subjects": subjects,
+            }
         )
-
-    def _create_fresh_session(self):
-        """
-        Create a fresh session with appropriate settings.
-        """
-        if hasattr(self, "session"):
-            self.session.close()
-
-        # Create a new session
-        self.session = requests.Session()
-
-        # Set up retry mechanism
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=self.retry_attempts,
-            pool_connections=10,
-            pool_maxsize=10,
-            pool_block=False,
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-        self.headers["User-Agent"] = get_random_user_agent()
-
-        self.logger.info(
-            f"Created fresh session with user agent: {self.headers['User-Agent']}"
-        )
-
-        return self.session
-
-    def _reset_connection_pool_if_needed(self):
-        """
-        Reset the connection pool if it's been too long since the last reset.
-        This helps prevent "Remote end closed connection without response" errors.
-        """
-        current_time = time.time()
-        if current_time - self._last_reset_time > self._reset_interval:
-            self.logger.info(
-                f"Resetting connection pool after {self._reset_interval} seconds"
-            )
-
-            # Create a fresh session
-            self._create_fresh_session()
-
-            self._last_reset_time = current_time
-
-    def _process_bill_list(self, bill_list):
-        """
-        Process the bill list with error handling and circuit breaker pattern.
-        """
-        for item in bill_list.do_scrape():
-            try:
-                # Reset connection pool if needed
-                self._reset_connection_pool_if_needed()
-
-                # Add a random delay between processing items
-                add_random_delay(1, 3)
-
-                # If we've had too many consecutive failures, pause for a while
-                if self._consecutive_failures >= self._max_consecutive_failures:
-                    self.logger.warning(
-                        f"Circuit breaker triggered after {self._consecutive_failures} consecutive failures. "
-                        f"Pausing for {self._circuit_breaker_timeout} seconds."
-                    )
-                    time.sleep(self._circuit_breaker_timeout)
-                    self._consecutive_failures = 0
-
-                    # Rotate user agent after circuit breaker timeout
-                    self.headers["User-Agent"] = get_random_user_agent()
-
-                yield item
-
-                # Reset consecutive failures counter on success
-                self._consecutive_failures = 0
-
-            except Exception as e:
-                self._consecutive_failures += 1
-                self.logger.error(f"Error processing item: {e}")
-
-                # If it's a connection error, add a longer delay
-                if isinstance(e, (ConnectionError, RemoteDisconnected)):
-                    self.logger.warning("Connection error. Adding longer delay.")
-                    add_random_delay(5, 15)
-
-                    # Rotate user agent after connection error
-                    self.headers["User-Agent"] = get_random_user_agent()
+        yield from bill_list.do_scrape(scraper=self)

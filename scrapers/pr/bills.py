@@ -2,7 +2,6 @@
 import re
 import lxml.html
 import datetime
-import requests
 import pytz
 from openstates.scrape import Scraper, Bill, VoteEvent as Vote
 
@@ -45,20 +44,26 @@ _classifiers = (
 
 class PRBillScraper(Scraper):
     _TZ = pytz.timezone("America/Puerto_Rico")
-    s = requests.Session()
 
     # keep a reference to the last search results page
     # so we can scrape the right event validation code
     # for paginating
     last_page = None
 
+    # measure codes from the site's "Tipo de Medida" list; a trailing C is the
+    # Cámara, a trailing S (and NM) the Senado
     bill_types = {
-        "P": "bill",
-        "R": "resolution",
-        "RK": "concurrent resolution",
-        "RC": "joint resolution",
+        "PC": "bill",
+        "PS": "bill",
+        "PRC": "bill",
+        "PRS": "bill",
+        "RC": "resolution",
+        "RS": "resolution",
+        "RCC": "joint resolution",
+        "RCS": "joint resolution",
+        "RKC": "concurrent resolution",
+        "RKS": "concurrent resolution",
         "NM": "appointment",
-        # 'PR': 'plan de reorganizacion',
     }
 
     def clean_name(self, name):
@@ -71,19 +76,14 @@ class PRBillScraper(Scraper):
     # window_start / window_end - Show bills updated between start and end. Format Y-m-d
     # window_end is optional, defaults to today if window_start is set
     # tipo is leg type: PC, PS, etc. See "Tipo de Medida" on the search form
-    def scrape(self, session=None, chamber=None, page=None):
+    def scrape(self, session=None):
         self.seen_votes = set()
         self.seen_bills = set()
         self.seen_bill_identifiers = set()
-        chambers = [chamber] if chamber is not None else ["upper", "lower"]
-        for chamber in chambers:
-            yield from self.scrape_search_results(
-                chamber,
-                session,
-                page,
-            )
+        self.author_names = {}
+        yield from self.scrape_search_results(session)
 
-    def scrape_search_results(self, chamber, session, page=None):
+    def scrape_search_results(self, session):
         cuatrienio_id = session[0:4]
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -91,7 +91,7 @@ class PRBillScraper(Scraper):
             "upgrade-insecure-requests": "1",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         }
-        resp = self.s.get(
+        resp = self.get(
             "https://sutra.oslpr.org/medidas?cuatrienio_id={}&autores=&comision_id=&page=1".format(
                 cuatrienio_id
             ),
@@ -104,7 +104,7 @@ class PRBillScraper(Scraper):
         )[-1]
         pages = re.findall(r"\d+", pagelist)[0]
         for number in range(1, int(pages) + 1):
-            resps = self.s.get(
+            resps = self.get(
                 "https://sutra.oslpr.org/medidas?cuatrienio_id={}&autores=&comision_id=&page={}".format(
                     cuatrienio_id, number
                 ),
@@ -121,7 +121,7 @@ class PRBillScraper(Scraper):
                 # bill_rid = '122472'
                 bill_url = "https://sutra.oslpr.org{}".format(row)
                 if bill_url not in self.seen_bills:
-                    yield from self.scrape_bill(chamber, session, bill_url)
+                    yield from self.scrape_bill(session, bill_url)
                     self.seen_bills.add(bill_url)
 
     def classify_action(self, action_text):
@@ -129,12 +129,6 @@ class PRBillScraper(Scraper):
             if re.match(pattern, action_text):
                 return [action_actor, atype]
         return ["", None]
-
-    def classify_bill_type(self, bill_id):
-        for abbr, value in self.bill_types.items():
-            if bill_id.startswith(abbr):
-                return value
-        return None
 
     def classify_media_type(self, url):
         url = url.lower()
@@ -198,7 +192,7 @@ class PRBillScraper(Scraper):
             vote_chamber = "lower"
         elif "Senado aprueba" in vote_name:
             vote_chamber = "upper"
-        elif "Aprobado mediante votación por lista":
+        elif "Aprobado mediante votación por lista" in vote_name:
             vote_chamber = bill_chamber
         else:
             raise AssertionError("Unknown vote text found: {}".format(vote_name))
@@ -283,9 +277,19 @@ class PRBillScraper(Scraper):
             "cookie": "_ga=GA1.2.2038047349.1736526892; _ga_VQ7KX9LLCG=GS1.1.1736526892.1.1.1736526940.0.0.0",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         }
-        html = self.s.get(authurl, headers=headers, verify=False).text
-        page = lxml.html.fromstring(html)
-        name = page.xpath("//title/text()")[0].strip().replace(" - Sutra", "")
+        # author urls are legisladores/M-<legislator>-<bill>; the page only
+        # depends on the legislator
+        legislator = authurl.rsplit("-", 1)[0]
+        if legislator not in self.author_names:
+            html = self.get(authurl, headers=headers, verify=False).text
+            page = lxml.html.fromstring(html)
+            name = page.xpath("//title/text()")[0].strip()
+            # site renders titles like "Jane  Doe - Sistema Único de Trámite Legislativo"
+            # (sometimes with a double dash, e.g. "Jane Doe - - Sistema...")
+            self.author_names[legislator] = re.sub(
+                r"[\s-]*Sistema Único de Trámite Legislativo\s*$", "", name
+            ).strip()
+        name = self.author_names[legislator]
         # currently not saving sponsor party, but here's the xpath
         # sometimes there's an extra dummy row beyond the first
         if name != "Legislador":
@@ -349,14 +353,14 @@ class PRBillScraper(Scraper):
             # else:
             self.parse_version(bill, row)
 
-    def scrape_bill(self, chamber, session, url):
+    def scrape_bill(self, session, url):
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "cache-control": "max-age=0",
             "upgrade-insecure-requests": "1",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         }
-        html = self.s.get(url, headers=headers, verify=False).text
+        html = self.get(url, headers=headers, verify=False).text
         page = lxml.html.fromstring(html)
 
         page_header_elems = page.xpath(
@@ -385,7 +389,9 @@ class PRBillScraper(Scraper):
         else:
             self.seen_bill_identifiers.add(bill_id)
 
-        bill_type = self.classify_bill_type(bill_id)
+        code = re.match(r"[A-Z]+", bill_id).group()
+        bill_type = self.bill_types.get(code)
+        chamber = "lower" if code.endswith("C") else "upper"
 
         bill = Bill(
             bill_id,

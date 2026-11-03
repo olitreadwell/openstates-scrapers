@@ -5,10 +5,10 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 import dateutil.parser
+import lxml.html
 from openstates.scrape import Scraper, Bill, VoteEvent
-from .common import session_slugs
-from spatula import HtmlListPage, HtmlPage, CSS, XPath, SelectorError, SkipItem
-from scrapelib import HTTPError
+from .common import get_session_slug
+from spatula import HtmlListPage, HtmlPage, CSS, XPath, SelectorError
 
 TZ = pytz.timezone("PST8PDT")
 ACTION_CLASSIFIERS = (
@@ -23,7 +23,7 @@ ACTION_CLASSIFIERS = (
         ["committee-passage", "reading-3", "passage"],
     ),
     ("From committee: .+? pass", ["committee-passage"]),
-    ("Prefiled. Referred", ["introduction", "referral-committee"]),
+    (r"Prefiled\.\s*Referred", ["introduction", "referral-committee"]),
     ("Read first time. Referred", ["reading-1", "referral-committee"]),
     ("Read first time.", ["reading-1"]),
     ("Read second time.", ["reading-2"]),
@@ -32,6 +32,8 @@ ACTION_CLASSIFIERS = (
     ("Read third time.", ["reading-3"]),
     ("Rereferred", ["referral-committee"]),
     ("Resolution read and adopted", ["passage"]),
+    # joint resolutions; NELIS may break the line after "read."
+    (r"Resolution read\.\s*Passed", ["passage"]),
     ("Enrolled and delivered", ["enrolled"]),
     ("To enrollment", ["passage"]),
     ("Approved by the Governor", ["executive-signature"]),
@@ -81,6 +83,17 @@ def extract_bdr(title):
     return bdr
 
 
+def add_bdr_relationship(bill, bdr, legislative_session):
+    """Add a BDR relationship without applying bill identifier normalization, which was adding a space"""
+    bill.related_bills.append(
+        {
+            "identifier": bdr,
+            "legislative_session": legislative_session,
+            "relation_type": "replaces",
+        }
+    )
+
+
 def shorten_bill_title(title):
     """
     Used in cases where the bill title exceeds the
@@ -93,6 +106,17 @@ def shorten_bill_title(title):
         title, bdr_full = title_bdr_match.groups()
     title = f"{title[:280]}... + {bdr_full}"
     return title
+
+
+# NELIS sends UTF-8 fragments with no charset declaration,
+# which lxml would otherwise decode as Latin-1 (O’Neill -> Oâ\x80\x99Neill)
+UTF8_PARSER = lxml.html.HTMLParser(encoding="utf-8")
+
+
+class Utf8HtmlMixin:
+    def postprocess_response(self):
+        self.root = lxml.html.fromstring(self.response.content, parser=UTF8_PARSER)
+        self.root.make_links_absolute(self.source.url)
 
 
 class BillTitleLengthError(BaseException):
@@ -109,15 +133,16 @@ class BillStub:
     source_url: str
     identifier: str
     session: str
+    session_slug: str
     subjects: list
 
 
-class SubjectMapping(HtmlPage):
-    example_input = {"session": "81"}
+class SubjectMapping(Utf8HtmlMixin, HtmlPage):
+    example_input = {"session": "81", "session_slug": "81st2021"}
 
     def get_source_from_input(self):
         session = self.input["session"]
-        slug = session_slugs[session]
+        slug = self.input["session_slug"]
         if "Special" in session:
             year = slug[4:8]
             url = f"https://www.leg.state.nv.us/App/NELIS/REL/{slug}/Bills/List"
@@ -157,13 +182,13 @@ class SubjectMapping(HtmlPage):
         return subjects
 
 
-class BillList(HtmlListPage):
-    example_input = {"session": "81"}
+class BillList(Utf8HtmlMixin, HtmlListPage):
+    example_input = {"session": "81", "session_slug": "81st2021"}
     selector = CSS(".row a")
     dependencies = {"subject_mapping": SubjectMapping}
 
     def get_source_from_input(self):
-        slug = session_slugs[self.input["session"]]
+        slug = self.input["session_slug"]
         # PageSize 2**31 from their site
         return (
             f"https://www.leg.state.nv.us/App/NELIS/REL/{slug}/"
@@ -184,22 +209,24 @@ class BillList(HtmlListPage):
                 link,
                 identifier,
                 self.input["session"],
+                self.input["session_slug"],
                 list(self.subject_mapping[identifier]),
             )
         )
 
 
-class BillTabDetail(HtmlPage):
+class BillTabDetail(Utf8HtmlMixin, HtmlPage):
     example_input = BillStub(
         "https://www.leg.state.nv.us/App/NELIS/REL/81st2021/Bill/7262/Overview",
         "AB20",
         "81",
+        "81st2021",
         ["test subject"],
     )
 
     def get_source_from_input(self):
         bill_key = self.input.source_url.split("/")[-2]
-        slug = session_slugs[self.input.session]
+        slug = self.input.session_slug
         url = (
             f"https://www.leg.state.nv.us/App/NELIS/REL/{slug}/Bill/"
             f"FillSelectedBillTab?selectedTab=Overview&billKey={bill_key}"
@@ -210,7 +237,6 @@ class BillTabDetail(HtmlPage):
     def process_error_response(self, exception: Exception) -> None:
         message = f"Encountered error fetching Bill Overview for {self.input.identifier}, skipping {self.input.source_url}"
         self.logger.warning(message)
-        raise SkipItem(message)
 
     def get_column_div(self, name):
         # lots of places where we have a <div class='col-md-2 font-weight-bold'>
@@ -260,47 +286,56 @@ class BillTabDetail(HtmlPage):
         # Sometimes NV bill page might just not have an actions section at all
         try:
             for row in XPath("//caption/parent::table/tbody/tr").match(self.root):
-                date, action, _ = [x.text for x in row.getchildren()]
+                date, cell, _ = [x.text for x in row.getchildren()]
                 date = parse_date(date)
 
-                # catch chamber changes
-                if action.startswith("In Assembly"):
-                    actor = "lower"
-                elif action.startswith("In Senate"):
-                    actor = "upper"
-                elif "Governor" in action:
-                    actor = "executive"
-
-                action_type = []
-                for pattern, atype in ACTION_CLASSIFIERS:
-                    if not re.search(pattern, action, re.IGNORECASE):
+                # NELIS joins a day's steps with \r, and the chamber can change
+                # mid-cell ("... To Senate.\rIn Senate.\rRead first time...").
+                # Start a new action at each "In Assembly"/"In Senate" line.
+                segments = []
+                for line in cell.split("\r"):
+                    if line.startswith("In Assembly"):
+                        actor = "lower"
+                    elif line.startswith("In Senate"):
+                        actor = "upper"
+                    elif segments:
+                        segments[-1][1].append(line)
                         continue
-                    # sometimes NV returns multiple actions in the same posting
-                    # so don't break here
-                    action_type = action_type + atype
+                    segments.append((actor, [line]))
+                # a trailing marker only says where the bill goes next
+                if len(segments) > 1 and len(segments[-1][1]) == 1:
+                    segments[-2][1].append(segments.pop()[1][0])
 
-                if not action_type:
-                    action_type = None
-                else:
-                    action_type = list(set(action_type))
-
-                related_entities = []
-                if "Committee on" in action:
-                    committees = re.findall(r"Committee on ([a-zA-Z, ]*)\.", action)
-                    for committee in committees:
-                        related_entities.append(
-                            {"type": "committee", "name": committee}
-                        )
-
-                bill.add_action(
-                    description=action,
-                    date=date,
-                    chamber=actor,
-                    classification=action_type,
-                    related_entities=related_entities,
-                )
+                for seg_actor, lines in segments:
+                    action = "\r".join(lines)
+                    if not action.startswith("In ") and "Governor" in action:
+                        actor = seg_actor = "executive"
+                    self.add_action(bill, date, action, seg_actor)
         except SelectorError:
             pass
+
+    def add_action(self, bill, date, action, actor):
+        action_type = []
+        for pattern, atype in ACTION_CLASSIFIERS:
+            if not re.search(pattern, action, re.IGNORECASE):
+                continue
+            # sometimes NV returns multiple actions in the same posting
+            # so don't break here
+            action_type = action_type + atype
+
+        if not action_type:
+            action_type = None
+        else:
+            action_type = list(set(action_type))
+
+        act = bill.add_action(
+            description=action,
+            date=date,
+            chamber=actor,
+            classification=action_type,
+        )
+        for committee in re.findall(r"Committee on ([a-zA-Z, ]*)\.", action):
+            act.add_related_entity(committee, "organization")
 
     def process_page(self):
         chamber = "upper" if self.input.identifier.startswith("S") else "lower"
@@ -356,7 +391,9 @@ class BillTabDetail(HtmlPage):
 
         bdr = extract_bdr(short_title)
         if bdr:
+            bdr = f"BDR {bdr}"
             bill.extras["BDR"] = bdr
+            add_bdr_relationship(bill, bdr, self.input.session)
 
         text_url = self.source.url.replace("Overview", "Text")
         yield BillTabText(bill, source=text_url)
@@ -366,7 +403,7 @@ class BillTabDetail(HtmlPage):
         yield VotesTab(bill, source=votes_url)
 
 
-class BillTabText(HtmlPage):
+class BillTabText(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "GetBillVoteMembers?voteKey=10429&voteResultPanel=All"
@@ -379,19 +416,17 @@ class BillTabText(HtmlPage):
             title = row.text_content()
             link = row.get("href")
             bill.add_version_link(
-                title, link, media_type="application/pdf", on_duplicate="ignore"
+                title,
+                link,
+                classification="amendment" if "/Amendments/" in link else "",
+                media_type="application/pdf",
+                on_duplicate="ignore",
             )
         ex_url = self.source.url.replace("Text", "Exhibits")
-
-        try:
-            return ExhibitTabText(bill, source=ex_url)
-        except HTTPError:
-            self.warning(f"Failure on exhibit url {ex_url}")
-            am_url = self.source.url.replace("Text", "Amendments")
-            return AmendmentTabText(bill, source=am_url)
+        return ExhibitTabText(bill, source=ex_url)
 
 
-class ExhibitTabText(HtmlPage):
+class ExhibitTabText(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "FillSelectedBillTab?selectedTab=Exhibits&billKey=9581"
@@ -400,7 +435,6 @@ class ExhibitTabText(HtmlPage):
     def process_error_response(self, exception: Exception) -> None:
         message = f"Encountered error fetching Exhibits tab, skipping {self.source}"
         self.logger.warning(message)
-        raise SkipItem(message)
 
     def process_page(self):
         bill = self.input
@@ -410,30 +444,11 @@ class ExhibitTabText(HtmlPage):
             bill.add_document_link(
                 title, link, media_type="application/pdf", on_duplicate="ignore"
             )
-        am_url = self.source.url.replace("Text", "Amendments")
-        return AmendmentTabText(bill, source=am_url)
-
-
-class AmendmentTabText(HtmlPage):
-    example_source = (
-        "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
-        "FillSelectedBillTab?selectedTab=Amendments&billKey=10039"
-    )
-
-    def process_page(self):
-        bill = self.input
-        for row in CSS("col-11 col-md").match(self.root, min_items=0):
-            title = row.text_content()
-            link = row.get("href")
-            bill.add_version_link(
-                title, link, media_type="application/pdf", on_duplicate="ignore"
-            )
-
-        fn_url = self.source.url.replace("Text", "FiscalNotes")
+        fn_url = self.source.url.replace("Exhibits", "FiscalNotes")
         return FiscalTabText(bill, source=fn_url)
 
 
-class FiscalTabText(HtmlPage):
+class FiscalTabText(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "FillSelectedBillTab?selectedTab=FiscalNotes&billKey=9528"
@@ -442,8 +457,7 @@ class FiscalTabText(HtmlPage):
     def process_page(self):
         bill = self.input
         for row in CSS("ul.list-unstyled li a").match(self.root, min_items=0):
-            title = row.text_content()
-            title = f"Fiscal Note: {title}"
+            title = f"Fiscal Note: {row.text_content().strip()}"
             link = row.get("href")
             bill.add_document_link(
                 title, link, media_type="application/pdf", on_duplicate="ignore"
@@ -451,7 +465,7 @@ class FiscalTabText(HtmlPage):
         return bill
 
 
-class VotesTab(HtmlPage):
+class VotesTab(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "FillSelectedBillTab?selectedTab=Votes&billKey=9545"
@@ -466,7 +480,7 @@ class VotesTab(HtmlPage):
             return VoteList(dict(bill=bill, url=self.source.url), source=votes_url)
 
 
-class VoteList(HtmlPage):
+class VoteList(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "GetBillVotes?billKey=9545&voteTypeId=3"
@@ -477,7 +491,7 @@ class VoteList(HtmlPage):
         vote_url = input_data["url"]
         bill = input_data["bill"]
 
-        summaries = CSS("h2.h3", min_items=0).match(self.root)
+        summaries = CSS("h2.h3, h2.h4", min_items=0).match(self.root)
         if len(summaries) == 0:
             return
         summaries = [summary.text for summary in summaries]
@@ -487,6 +501,7 @@ class VoteList(HtmlPage):
             re.U | re.I,
         )
         date_re = re.compile(r"Date\s+(?P<date>.*)", re.U | re.I)
+        passed_re = re.compile(r"Passed\s+(?P<passed>Yes|No)\b", re.U | re.I)
         index = 0
 
         date_motion_counts = {}
@@ -501,6 +516,7 @@ class VoteList(HtmlPage):
 
             vote_options = {}
             start_date = None
+            passed = None
 
             for child_row in CSS("ul li", min_items=0).match(row):
                 content = child_row.text_content().strip()
@@ -515,6 +531,13 @@ class VoteList(HtmlPage):
                     start_date = date_match.groupdict()["date"]
                     start_date = parse_date(start_date)
 
+                passed_match = re.match(passed_re, content)
+                if passed_match:
+                    passed = passed_match.group("passed").lower() == "yes"
+
+            if passed is None:
+                passed = vote_options["yea"] > vote_options["nay"]
+
             # sometimes two votes with the same motion happen on the same day
             # hence we need to make motion text unique otherwise import fails
             date_motion = f"{start_date.date()}{summary}"
@@ -528,7 +551,7 @@ class VoteList(HtmlPage):
             vote = VoteEvent(
                 chamber=chamber,
                 motion_text=summary,
-                result="pass" if vote_options["yea"] > vote_options["nay"] else "fail",
+                result="pass" if passed else "fail",
                 classification="passage",
                 start_date=start_date,
                 bill=bill,
@@ -541,7 +564,7 @@ class VoteList(HtmlPage):
             yield VoteMembers(vote, source=votes_members_url)
 
 
-class VoteMembers(HtmlPage):
+class VoteMembers(Utf8HtmlMixin, HtmlPage):
     example_source = (
         "https://www.leg.state.nv.us/App/NELIS/REL/82nd2023/Bill/"
         "GetBillVotes?billKey=9545&voteTypeId=3"
@@ -566,7 +589,94 @@ class VoteMembers(HtmlPage):
 
 
 class NVBillScraper(Scraper):
-    def scrape(self, session=None):
+    def scrape_bdrs(self, session, session_slug):
+        list_url = f"https://www.leg.state.nv.us/App/NELIS/REL/{session_slug}/Bdrs/List"
+        data_url = (
+            f"https://www.leg.state.nv.us/App/NELIS/REL/{session_slug}/"
+            "HomeBdr/SearchBdrs"
+        )
+        response = self.get(
+            data_url,
+            params={"searchText": "", "orderByNumber": "true", "returnAll": "true"},
+        )
+        root = lxml.html.fromstring(response.content, parser=UTF8_PARSER)
+
+        rows = root.xpath(
+            '//div[contains(concat(" ", normalize-space(@class), " "), '
+            '" bdr-container ")]/div[contains(concat(" ", '
+            'normalize-space(@class), " "), " row ")]'
+        )
+        for row in rows:
+            columns = row.xpath("./div")
+            number_column, detail_column, date_column = (
+                columns[0],
+                columns[1],
+                columns[-1],
+            )
+
+            # Once a BDR has an introduced bill, the regular bill scraper has
+            # richer data and should be the only source for that item.
+            linked_bill = number_column.xpath(".//a//text()[normalize-space()]")
+            if linked_bill:
+                continue
+
+            bdr_number = " ".join(
+                number_column.xpath("./text()[normalize-space()]")[0].split()
+            )
+            bdr_number = f"BDR {bdr_number}"
+            sponsor_node = detail_column.xpath(
+                './/span[contains(concat(" ", normalize-space(@class), " "), '
+                '" font-weight-bold ")]'
+            )[0]
+            sponsor = " ".join(sponsor_node.text_content().split())
+            title = " ".join(
+                detail_column.xpath(
+                    "./br[1]/following-sibling::text()[normalize-space()]"
+                )[0].split()
+            )
+            filed_date = " ".join(
+                date_column.xpath("./text()[normalize-space()]")[0].split()
+            )
+
+            bill = Bill(
+                identifier=bdr_number,
+                legislative_session=session,
+                title=title,
+                chamber="legislature",
+                classification="proposed bill",
+            )
+            bill.add_source(list_url)
+            bill.add_action(
+                description="Filed",
+                date=parse_date(filed_date).date(),
+                chamber="legislature",
+                classification="filing",
+            )
+
+            if sponsor.lower().startswith("assemblymember "):
+                sponsor = re.sub(r"^assemblymember\s+", "", sponsor, flags=re.I)
+                entity_type = "person"
+                chamber = "lower"
+            elif sponsor.lower().startswith("senator "):
+                sponsor = re.sub(r"^senator\s+", "", sponsor, flags=re.I)
+                entity_type = "person"
+                chamber = "upper"
+            else:
+                entity_type = "organization"
+                chamber = None
+            bill.add_sponsorship(
+                name=sponsor,
+                classification="sponsor",
+                entity_type=entity_type,
+                primary=True,
+                chamber=chamber,
+            )
+            yield bill
+
+    def scrape(self, session=None, prefiles=True):
         logging.getLogger("scrapelib").setLevel(logging.WARNING)
-        bill_list = BillList({"session": session})
-        yield from bill_list.do_scrape()
+        session_slug = get_session_slug(self.jurisdiction, session)
+        bill_list = BillList({"session": session, "session_slug": session_slug})
+        if prefiles:
+            yield from self.scrape_bdrs(session, session_slug)
+        yield from bill_list.do_scrape(scraper=self)

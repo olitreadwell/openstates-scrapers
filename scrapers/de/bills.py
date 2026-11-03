@@ -4,12 +4,14 @@ import json
 from json.decoder import JSONDecodeError
 from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 import random
+import re
 import time
+from urllib.parse import urljoin
 
-import requests
+import fitz
 from openstates.scrape import Scraper, Bill, VoteEvent
 from utils import LXMLMixin
-from .actions import Categorizer
+from .actions import BILL_ID, Categorizer
 
 
 class FailedBillFetch:
@@ -19,7 +21,7 @@ class FailedBillFetch:
 
 
 class DEBillScraper(Scraper, LXMLMixin):
-    verify = False
+    base_url = "https://legis.delaware.gov"
 
     categorizer = Categorizer()
     chamber_codes = {"upper": 1, "lower": 2}
@@ -28,8 +30,9 @@ class DEBillScraper(Scraper, LXMLMixin):
     legislators = {}
     legislators_by_short = {}
     legislators_by_district = {}
-
-    session = requests.Session()
+    # roll call PDF url -> (motion, classification); consent calendars are
+    # shared by every bill on them
+    vote_motions = {}
 
     """
     DE has caucus-specific sites that it now
@@ -45,16 +48,25 @@ class DEBillScraper(Scraper, LXMLMixin):
     }
 
     def decode_and_retry_request(
-        self, log_label, request_method, attempt=1, retries=3, raise_exception=True
+        self,
+        log_label,
+        request_method,
+        attempt=1,
+        retries=3,
+        raise_exception=True,
+        empty_ok=False,
     ):
         """
-        Delaware is giving us a lot of malformed responses that are HTTP OK nonetheless
-        Normally flakey requests could be handled by http-resilience mode, but because the HTTP response
-        is normal (just empty/not-decodable-to-JSON)
-        So we have several places where we need to retry the decode step
+        Decode a JSON response, retrying the request if it isn't JSON.
+        HTTP errors (the site answers 403 when requests come too fast) are
+        retried by scrapelib. The JSON endpoints answer an empty 200 when there
+        is nothing to return (a bill with no votes or no actions); with
+        empty_ok that is returned as None without retrying.
         """
         try:
             response = request_method()
+            if empty_ok and response.status_code == 200 and not response.content:
+                return None
             data = json.loads(response.content.decode("utf-8"))
             return data
         except (JSONDecodeError, RequestsJSONDecodeError) as error:
@@ -67,7 +79,12 @@ class DEBillScraper(Scraper, LXMLMixin):
                 )
                 time.sleep(delay)
                 return self.decode_and_retry_request(
-                    log_label, request_method, attempt + 1, retries, raise_exception
+                    log_label,
+                    request_method,
+                    attempt + 1,
+                    retries,
+                    raise_exception,
+                    empty_ok,
                 )
             else:
                 self.warning(
@@ -99,8 +116,12 @@ class DEBillScraper(Scraper, LXMLMixin):
             "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         }
 
-        self.retry_attempts = 10
-        self.retry_wait_seconds = 30
+        # legis.delaware.gov answers 403 to more than about 160 requests a
+        # minute and lifts the block within seconds, so throttle every
+        # request below that and retry 403s quickly (2, 4, 8, ... s)
+        self.requests_per_minute = 150
+        self.retry_attempts = 8
+        self.retry_wait_seconds = 2
         self.timeout = 130
         self.init_asp()
         self.headers["x-requested-with"] = "XMLHttpRequest"
@@ -126,7 +147,12 @@ class DEBillScraper(Scraper, LXMLMixin):
                 self.info("Found no more bills in pagination")
                 break
             for bill in page["Data"]:
-                bills_and_votes.extend(list(self.scrape_bill(bill, session)))
+                try:
+                    bills_and_votes.extend(list(self.scrape_bill(bill, session)))
+                except (JSONDecodeError, RequestsJSONDecodeError):
+                    bills_and_votes.append(
+                        FailedBillFetch(bill["LegislationDisplayCode"], "json")
+                    )
             page_number += 1
             if end_page and page_number > end_page:
                 self.info(
@@ -146,11 +172,12 @@ class DEBillScraper(Scraper, LXMLMixin):
         """
         # Map of {bill_id: bill}
         bills = {}
+        votes = []
 
         for bill in items:
             # The generator also yields VoteEvent objects
             if isinstance(bill, VoteEvent):
-                yield bill
+                votes.append(bill)
                 continue
 
             # The generator also includes FailedBill objects representing failures to fetch
@@ -186,6 +213,13 @@ class DEBillScraper(Scraper, LXMLMixin):
             else:
                 self.warning(f"Ignoring substituted bill `{bill.identifier}`")
 
+        # a vote on a bill later replaced by its substitute belongs to the
+        # bill that is kept, or it would point at a bill that isn't saved
+        for vote in votes:
+            kept = bills.get(vote.bill_identifier)
+            if kept and vote.bill != kept._id:
+                vote.set_bill(kept)
+            yield vote
         yield from bills.values()
 
     def scrape_bill(self, row, session):
@@ -242,53 +276,44 @@ class DEBillScraper(Scraper, LXMLMixin):
             return
 
         additional_sponsors = html.xpath(
-            '//label[text()="Additional Sponsor(s):"]/following-sibling::div/a/@href'
+            '//label[text()="Additional Sponsor(s):"]/following-sibling::div/a'
         )
 
-        for sponsor_url in additional_sponsors:
-            sponsor_key = "DistrictId"
-            if sponsor_url.startswith("https://legis"):
-                sponsor_id = sponsor_url.replace(
-                    "https://legis.delaware.gov/LegislatorDetail?personId=", ""
+        for sponsor_link in additional_sponsors:
+            sponsor_id, sponsor_key = self.parse_sponsor_link(sponsor_link)
+            if sponsor_id is not None:
+                self.add_sponsor_by_legislator_id(
+                    bill, sponsor_id, "primary", sponsor_key
                 )
-                sponsor_key = "PersonId"
-            else:
-                for k, v in self.potential_sponsor_urls.items():
-                    if sponsor_url.startswith(f"https://{k}"):
-                        sponsor_id = sponsor_url.replace(v, "")
-                        break
-            self.add_sponsor_by_legislator_id(bill, sponsor_id, "primary", sponsor_key)
 
         cosponsors = html.xpath(
-            '//label[text()="Co-Sponsor(s):"]/following-sibling::div/a/@href'
+            '//label[text()="Co-Sponsor(s):"]/following-sibling::div/a'
         )
-        for sponsor_url in cosponsors:
-            sponsor_key = "DistrictId"
-            if sponsor_url.startswith("https://legis"):
-                sponsor_id = sponsor_url.replace(
-                    "https://legis.delaware.gov/LegislatorDetail?personId=", ""
+        for sponsor_link in cosponsors:
+            sponsor_id, sponsor_key = self.parse_sponsor_link(sponsor_link)
+            if sponsor_id is not None:
+                self.add_sponsor_by_legislator_id(
+                    bill, sponsor_id, "cosponsor", sponsor_key
                 )
-                sponsor_key = "PersonId"
-            else:
-                for k, v in self.potential_sponsor_urls.items():
-                    if sponsor_url.startswith(f"https://{k}"):
-                        sponsor_id = sponsor_url.replace(v, "")
-                        break
-            self.add_sponsor_by_legislator_id(bill, sponsor_id, "primary", sponsor_key)
 
         versions = html.xpath(
-            '//label[text()="Original Text:"]/following-sibling::div/a/@href'
+            '//label[text()="Original / Not Amended:"]/following-sibling::div/a/@href'
         )
         for version_url in versions:
+            version_url = urljoin(self.base_url, version_url)
             media_type = self.mime_from_link(version_url)
             version_name = "Bill Text"
             bill.add_version_link(version_name, version_url, media_type=media_type)
 
         fiscals = html.xpath('//div[contains(@class,"fiscalNote")]/a/@href')
         for fiscal in fiscals:
-            self.scrape_fiscal_note(bill, fiscal)
+            self.scrape_fiscal_note(bill, urljoin(self.base_url, fiscal))
 
         self.scrape_actions(bill, row["LegislationId"])
+
+        # Fall back to the bill detail HTML when the actions API is empty.
+        if not bill.actions:
+            self.scrape_fallback_actions_from_html(bill, html)
 
         if row["HasAmendments"] is True:
             self.scrape_amendments(bill, row["LegislationId"])
@@ -306,12 +331,8 @@ class DEBillScraper(Scraper, LXMLMixin):
                 '//label[contains(text(),"Sunset Date")]/following-sibling::div/text()'
             )[0].strip()
 
-            if html.xpath("//a[contains(@href,'SessionLaws/Chapter')]/@href"):
-                code_url = html.xpath(
-                    "//a[contains(@href,'SessionLaws/Chapter')]/@href"
-                )[0]
-            else:
-                code_url = None
+            code_urls = html.xpath("//a[contains(@href,'SessionLaws/Chapter')]/@href")
+            code_url = urljoin(self.base_url, code_urls[0]) if code_urls else None
 
             if "N/A" in eff_date or eff_date == "" or len(eff_date) > 9:
                 eff_date = None
@@ -344,12 +365,13 @@ class DEBillScraper(Scraper, LXMLMixin):
         }
 
         self.info("Fetching legislators")
-        page = self.session.post(
+        page = self.post(
             url=search_form_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         ).content
 
         page = json.loads(page)
@@ -357,7 +379,13 @@ class DEBillScraper(Scraper, LXMLMixin):
         for row in page["Data"]:
             self.legislators[str(row["PersonId"])] = row
             self.legislators_by_short[str(row["ShortName"])] = row
-            self.legislators_by_district[row["DistrictNumber"]] = row
+            # House and Senate both number their districts from 1, and a
+            # seat's former holder stays listed beside the current one
+            key = (row["ChamberId"], row["DistrictNumber"])
+            if key not in self.legislators_by_district or row[
+                "LegislatorDetailLink"
+            ].startswith("http"):
+                self.legislators_by_district[key] = row
 
     def scrape_fiscal_note(self, bill, link):
         media_type = self.mime_from_link(link)
@@ -370,15 +398,17 @@ class DEBillScraper(Scraper, LXMLMixin):
         form = {"legislationId": legislation_id, "sort": "", "group": "", "filter": ""}
         self.info(f"Searching for votes for {bill.identifier}")
         request_method = partial(
-            self.session.post,
+            self.post,
             url=votes_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         )
+        # an empty answer means the bill has no roll calls
         page = self.decode_and_retry_request(
-            "scrape_votes", request_method, retries=1, raise_exception=False
+            "scrape_votes", request_method, empty_ok=True
         )
         if page and page["Total"] > 0:
             for row in page["Data"]:
@@ -392,55 +422,55 @@ class DEBillScraper(Scraper, LXMLMixin):
 
         self.info(f"Fetching vote {vote_id} for {bill.identifier}")
         request_method = partial(
-            self.session.post,
+            self.post,
             url=vote_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         )
-        page = self.decode_and_retry_request(
-            "scrape_vote", request_method, retries=1, raise_exception=False
-        )
+        page = self.decode_and_retry_request("scrape_vote", request_method)
 
         if page:
             roll = page["Model"]
+            # a rescinded roll call is void and is retaken as a new one
+            if roll["RollCallStatus"] == "Rescinded":
+                self.info(f"Skipping rescinded roll call {vote_id}")
+                return
             vote_chamber = self.chamber_map[roll["ChamberName"]]
             # "7/1/16 01:00 AM"
             vote_date = dt.datetime.strptime(
                 roll["TakenAtDateTime"], "%m/%d/%y %I:%M %p"
             ).strftime("%Y-%m-%d")
 
-            # TODO: What does this code mean?
-            vote_motion = roll["RollCallVoteType"]
-
             vote_passed = "pass" if roll["RollCallStatus"] == "Passed" else "fail"
-            other_count = (
-                int(roll["NotVotingCount"])
-                + int(roll["VacantVoteCount"])
-                + int(roll["AbsentVoteCount"])
-                + int(roll["ConflictVoteCount"])
-            )
-            vote = VoteEvent(
-                chamber=vote_chamber,
-                start_date=vote_date,
-                motion_text=vote_motion,
-                result=vote_passed,
-                bill=bill,
-                legislative_session=session,
-                classification=[],
-            )
+            # VacantVoteCount is empty seats with no voter row, and
+            # NotVotingCount already includes ConflictVoteCount
+            other_count = int(roll["NotVotingCount"]) + int(roll["AbsentVoteCount"])
             vote_pdf_url = (
                 "https://legis.delaware.gov"
                 "/json/RollCallController/GenerateRollCallPdf"
                 f"?rollCallId={vote_id}&chamberId={self.chamber_codes[vote_chamber]}"
             )
+            if vote_pdf_url not in self.vote_motions:
+                self.vote_motions[vote_pdf_url] = self.scrape_vote_motion(vote_pdf_url)
+            vote_motion, vote_classification = self.vote_motions[vote_pdf_url]
+            vote = VoteEvent(
+                chamber=vote_chamber,
+                start_date=vote_date,
+                motion_text=vote_motion or roll["RollCallVoteType"],
+                result=vote_passed,
+                bill=bill,
+                legislative_session=session,
+                classification=vote_classification,
+            )
+            # the vote requirement: SM (simple majority), 2/3, 3/4, 3/5
+            vote.extras["vote_requirement"] = roll["RollCallVoteType"]
             # Vote URL is just a generic search URL with POSTed data,
             # so provide a different link
             vote.add_source(vote_pdf_url)
-            vote.dedupe_key = (
-                f"{bill}#{vote_id}#{vote_motion}#{vote_chamber}#{vote_date}"
-            )
+            vote.dedupe_key = f"{bill}#{vote_id}#{roll['RollCallVoteType']}#{vote_chamber}#{vote_date}"
             vote.set_count("yes", roll["YesVoteCount"])
             vote.set_count("no", roll["NoVoteCount"])
             vote.set_count("other", other_count)
@@ -465,11 +495,96 @@ class DEBillScraper(Scraper, LXMLMixin):
 
             yield vote
 
+    def should_cache_response(self, response):
+        # a missing roll call PDF redirects to an HTML error page that answers 200
+        url = (response.history or [response])[0].url
+        if "GenerateRollCallPdf" in url and not response.content.startswith(b"%PDF"):
+            return False
+        return super().should_cache_response(response)
+
+    def scrape_vote_motion(self, pdf_url):
+        """
+        The roll call JSON has no motion; the PDF header names one when the
+        vote isn't on the bill itself ("Motion: Veto Override", "Reason Taken:
+        motion to recess ..."), or it is a consent calendar. Returns no motion
+        and no classification if the PDF can't be read.
+        """
+        try:
+            for _ in range(3):
+                pdf = self.get(pdf_url, verify=False).content
+                if pdf.startswith(b"%PDF"):
+                    break
+                time.sleep(random.uniform(5, 10))
+            else:
+                raise ValueError("not a PDF")
+            blocks = fitz.open("pdf", pdf)[0].get_text("blocks")
+        except Exception as e:
+            self.warning(f"could not read roll call PDF {pdf_url}: {e}")
+            return None, []
+
+        motions = {}
+        for block in blocks:
+            label = None
+            for line in block[4].splitlines():
+                line = line.strip()
+                if line.startswith(("Long Title:", "Vote requirement:")):
+                    return self.classify_vote_motion(motions)
+                match = re.match(r"(Motion|Reason Taken):\s*(.*)", line, re.I)
+                if match:
+                    label = match.group(1).title()
+                    motions[label] = match.group(2)
+                # a wrapped reason, or a label with its text on the next line;
+                # "Motion: Veto Override" shares its block with the bill line
+                elif label and (label == "Reason Taken" or not motions[label]):
+                    motions[label] = f"{motions[label]} {line}".strip()
+                elif re.search(r"Consent (Calendar|Agenda)", line):
+                    return line, ["passage"]
+        return self.classify_vote_motion(motions)
+
+    def classify_vote_motion(self, motions):
+        motion = motions.get("Motion", "")
+        # "Motion: Other" is followed by the actual "Reason Taken:"
+        if motion in ("", "Other"):
+            motion = motions.get("Reason Taken") or motion
+        if not motion:
+            return "Passage", ["passage"]
+        if re.search(r"veto override|repass", motion, re.I):
+            return motion, ["veto-override"]
+        # "HB 160 Mulrooney Passed", "HCR 83 revote after reconsideration"
+        if re.match(BILL_ID, motion):
+            return "Passage", ["passage"]
+        return motion, []
+
+    def parse_sponsor_link(self, sponsor_link):
+        # The caucus district URL stays the same when a seat changes hands
+        # (a bill co-sponsored by the former member still links to it), so
+        # match on the link text, which is the member's ShortName
+        short_name = sponsor_link.text_content().strip()
+        if short_name in self.legislators_by_short:
+            return short_name, "ShortName"
+        return self.parse_sponsor_url(sponsor_link.get("href"))
+
+    def parse_sponsor_url(self, sponsor_url):
+        sponsor_url = urljoin(self.base_url, sponsor_url)
+        if sponsor_url.startswith(f"{self.base_url}/LegislatorDetail"):
+            sponsor_id = sponsor_url.replace(
+                f"{self.base_url}/LegislatorDetail?personId=", ""
+            )
+            return sponsor_id, "PersonId"
+        for k, v in self.potential_sponsor_urls.items():
+            if sponsor_url.startswith(f"https://{k}"):
+                chamber_id = 2 if k.startswith("house") else 1
+                return (chamber_id, sponsor_url.replace(v, "")), "DistrictId"
+        self.warning(f"Could not parse sponsor url, skipping: {sponsor_url}")
+        return None, None
+
     def add_sponsor_by_legislator_id(
         self, bill, legislator_id, sponsor_type, sponsor_key="PersonId"
     ):
         if sponsor_key == "DistrictId":
-            sponsor = self.legislators_by_district[str(legislator_id)]
+            sponsor = self.legislators_by_district[legislator_id]
+        elif sponsor_key == "ShortName":
+            sponsor = self.legislators_by_short[legislator_id]
         elif sponsor_key == "PersonId":
             sponsor = self.legislators[str(legislator_id)]
         sponsor_name = sponsor["DisplayName"]
@@ -498,20 +613,17 @@ class DEBillScraper(Scraper, LXMLMixin):
         form = {"legislationId": legislation_id, "sort": "", "group": "", "filter": ""}
         self.info(f"Fetching actions for {bill.identifier}")
         request_method = partial(
-            self.session.post,
+            self.post,
             url=actions_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         )
         page = self.decode_and_retry_request(
-            "scrape_actions", request_method, raise_exception=False
+            "scrape_actions", request_method, empty_ok=True
         )
-        # DE sometimes returns an empty body for a bill's actions (notably for
-        # very recently introduced bills). Treat that as "no actions yet" rather
-        # than a fatal failure, so the bill is still imported. Actions will
-        # backfill automatically once DE's endpoint returns data.
         if not page:
             self.warning(f"No actions returned for {bill.identifier}")
             return
@@ -548,6 +660,96 @@ class DEBillScraper(Scraper, LXMLMixin):
             for c in categorization["committees"]:
                 action.add_related_entity(c, "organization")
 
+    def scrape_fallback_actions_from_html(self, bill, html):
+        """Add actions from the bill detail HTML when the actions API is empty.
+
+        Only called when ``scrape_actions()`` did not add anything.
+        """
+        home_chamber = "upper" if bill.identifier.startswith("S") else "lower"
+
+        # "Introduced on: 6/30/26" -> description="Introduced", date=6/30/26
+        introduced_values = html.xpath(
+            '//label[@class="info-label" and '
+            'starts-with(normalize-space(text()), "Introduced on")]'
+            "/following-sibling::div[1]/text()"
+        )
+        if introduced_values:
+            intro_text = introduced_values[0].strip()
+            intro_date = self._parse_de_short_date(intro_text)
+            if intro_date:
+                bill.add_action(
+                    description="Introduced",
+                    date=intro_date,
+                    chamber=home_chamber,
+                    classification=["introduction"],
+                )
+
+        # "Status: House Natural Resources & Energy 6/30/26"
+        # -> description="House Natural Resources & Energy", date=6/30/26
+        status_values = html.xpath(
+            '//label[@class="info-label" and '
+            'normalize-space(text())="Status:"]'
+            "/following-sibling::div[1]/text()"
+        )
+        if status_values:
+            status_text = status_values[0].strip()
+            # Split off a trailing M/D/YY (or M/D/YYYY) date.
+            match = re.search(r"\s+(\d{1,2}/\d{1,2}/\d{2,4})\s*$", status_text)
+            if match:
+                status_date = self._parse_de_short_date(match.group(1))
+                description = status_text[: match.start()].strip()
+                if status_date and description:
+                    # Status text is "{Chamber} {Committee Name}". Rewrite it to
+                    # match the categorizer's referral-committee rule.
+                    chamber_word = None
+                    if description.startswith("Senate"):
+                        action_chamber = "upper"
+                        chamber_word = "Senate"
+                    elif description.startswith("House"):
+                        action_chamber = "lower"
+                        chamber_word = "House"
+                    elif "Governor" in description:
+                        action_chamber = "executive"
+                    else:
+                        action_chamber = home_chamber
+
+                    if chamber_word:
+                        committee_name = description[len(chamber_word) :].strip()
+                        if committee_name:
+                            description = (
+                                f"Assigned to {committee_name} "
+                                f"Committee in {chamber_word}"
+                            )
+
+                    categorization = self.categorizer.categorize(description)
+                    action = bill.add_action(
+                        description=description,
+                        date=status_date,
+                        chamber=action_chamber,
+                        classification=categorization["classification"],
+                    )
+                    for leg in categorization["legislators"]:
+                        action.add_related_entity(leg, "person")
+                    for c in categorization["committees"]:
+                        action.add_related_entity(c, "organization")
+
+    def _parse_de_short_date(self, text):
+        """Parse DE's short date strings (e.g. "6/30/26") into YYYY-MM-DD.
+
+        Returns ``None`` if the string can't be parsed, so callers can skip
+        adding a malformed action rather than crashing the whole scrape.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+            try:
+                return dt.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        self.warning(f"Could not parse DE fallback action date: {text!r}")
+        return None
+
     def scrape_amendments(self, bill, legislation_id):
         # http://legis.delaware.gov/json/BillDetail/GetRelatedAmendmentsByLegislationId?legislationId=47185
         amds_url = (
@@ -557,12 +759,13 @@ class DEBillScraper(Scraper, LXMLMixin):
         form = {"sort": "", "group": "", "filter": ""}
         self.info(f"Fetching amendments for {bill.identifier}")
         request_method = partial(
-            self.session.post,
+            self.post,
             url=amds_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         )
         page = self.decode_and_retry_request("scrape_amendments", request_method)
 
@@ -581,6 +784,7 @@ class DEBillScraper(Scraper, LXMLMixin):
                 bill.add_version_link(
                     row["AmendmentCode"],
                     pdf_url,
+                    classification="amendment",
                     media_type="application/pdf",
                     on_duplicate="ignore",
                 )
@@ -593,6 +797,7 @@ class DEBillScraper(Scraper, LXMLMixin):
                 bill.add_version_link(
                     row["AmendmentCode"],
                     html_url,
+                    classification="amendment",
                     media_type="text/html",
                     on_duplicate="ignore",
                 )
@@ -637,12 +842,13 @@ class DEBillScraper(Scraper, LXMLMixin):
             "toIntroDate": "",
         }
 
-        response = self.session.post(
+        response = self.post(
             url=search_form_url,
             data=form,
             allow_redirects=True,
             verify=False,
             headers=self.headers,
+            timeout=self.timeout,
         )
         return response
 
@@ -658,7 +864,7 @@ class DEBillScraper(Scraper, LXMLMixin):
 
     # set up our asp session and fetch cookies
     def init_asp(self):
-        self.session.get(
+        self.get(
             "https://legis.delaware.gov/", verify=False, headers=self.headers
         ).content
         return

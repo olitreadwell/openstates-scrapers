@@ -1,5 +1,6 @@
 import re
 import datetime
+import functools
 import zoneinfo
 import urllib.parse
 import lxml.html
@@ -8,10 +9,11 @@ from io import BytesIO
 
 from openstates.scrape import Scraper, Bill, VoteEvent as Vote
 
-from utils import LXMLMixin
+from utils import LXMLMixin, SSLRetryMixin
 
 import fitz
 import requests
+import scrapelib
 from urllib3.exceptions import InsecureRequestWarning
 
 
@@ -75,7 +77,7 @@ def ensure_url_fully_qualified(url):
     return url
 
 
-class MNBillScraper(Scraper, LXMLMixin):
+class MNBillScraper(SSLRetryMixin, Scraper, LXMLMixin):
     # For testing purposes, this will do a lite version of things.  If
     # testing_bills is set, only these bills will be scraped.  Use SF0077
     testing = False
@@ -267,12 +269,13 @@ class MNBillScraper(Scraper, LXMLMixin):
             for start in range(bill_num_start, bill_num_end, stride):
                 # body: "House" or "Senate"
                 # session: legislative session id
-                # bill: Range start-end (e.g. 1-10)
+                # bill: Range start-end (e.g. 1-10), inclusive. The search caps at
+                # 500 rows sorted high to low, so a 501-wide range drops its first bill
                 url = BILL_SEARCH_URL % (
                     search_chamber,
                     search_session,
                     start,
-                    start + stride,
+                    start + stride - 1,
                     current_bill_type,
                 )
                 # Parse HTML
@@ -460,7 +463,7 @@ class MNBillScraper(Scraper, LXMLMixin):
         # https://www.revisor.mn.gov/bills/bill.php?b=House&f=HF2184&ssn=0&y=2025
         datestr = (
             datestr.replace("/225", "/2025")
-            .replace("/226", "2026")
+            .replace("/226", "/2026")
             .replace("05/272026", "05/27/2026")
         )
         date_formats = ["%m/%d/%Y", "%m/%d/%y"]
@@ -590,15 +593,24 @@ class MNBillScraper(Scraper, LXMLMixin):
             elif len(page_links) > 0:
                 pages.append(page_links[0])
 
-            # TODO: add votes back in once not broken
             # Try to extract vote
             # senate vote only, house votes are scraped by the vote_event.py scraper
-            # if current_chamber == "upper":
-            #     vote = self.extract_vote_from_action(
-            #         bill, bill_action, current_chamber, row, pages
-            #     )
-            #     if vote:
-            #         votes.append(vote)
+            if current_chamber == "upper":
+                try:
+                    vote = self.extract_vote_from_action(
+                        bill, bill_action, current_chamber, row, pages
+                    )
+                except Exception as e:
+                    # Senate journal vote links/pages are occasionally malformed
+                    # or point at content that doesn't parse as expected. Don't let
+                    # one bad vote link take down the whole bill scrape for it.
+                    self.warning(
+                        f"{bill.identifier}: failed to extract Senate vote from "
+                        f"action {bill_action['action_text']!r}: {e}"
+                    )
+                    vote = None
+                if vote:
+                    votes.append(vote)
 
         return bill_actions, votes
 
@@ -723,7 +735,11 @@ class MNBillScraper(Scraper, LXMLMixin):
                 "sc" in bill.identifier.lower() or "sr" in bill.identifier.lower()
             ):
                 current_html_url = self.rewrite_senate_resolution_url(current_html_url)
-            current_response = requests.get(current_html_url, verify=False)
+            # like the old bare requests.get, still parse whatever an error page returns
+            try:
+                current_response = self.get(current_html_url, verify=False)
+            except scrapelib.HTTPError as e:
+                current_response = e.response
             current_content = lxml.html.fromstring(current_response.content)
 
             other_page_version_rows = current_content.xpath(
@@ -789,6 +805,11 @@ class MNBillScraper(Scraper, LXMLMixin):
 
         return bill
 
+    # one Senate journal PDF (1-2.4MB) holds every roll call of that day
+    @functools.cache
+    def get_journal_pdf(self, url):
+        return self.get(url).content
+
     def extract_vote_from_action(self, bill, action, chamber, action_row, pages):
         """
         Gets vote data.  For the Senate, we can only get yes and no
@@ -820,7 +841,7 @@ class MNBillScraper(Scraper, LXMLMixin):
                         f"No vote url in the page. trying to use the previous vote url: {vote_url}"
                     )
                     if not vote_url:
-                        return [None] * 2
+                        return None
                 else:
                     vote_url = vote_element.xpath(".//a[@href]/@href")[0]
 
@@ -848,8 +869,7 @@ class MNBillScraper(Scraper, LXMLMixin):
                 vote.set_count("yes", yeas)
                 vote.set_count("no", nays)
 
-                pdf_response = self.get(pdf_url)
-                doc = fitz.open("pdf", BytesIO(pdf_response.content))
+                doc = fitz.open("pdf", BytesIO(self.get_journal_pdf(pdf_url)))
 
                 first_page = max(0, page_number - 2)
                 last_page = min(page_number, doc.page_count - 1)

@@ -10,13 +10,14 @@ import lxml.html
 import scrapelib
 
 from openstates.scrape import Scraper, Bill, VoteEvent
+from utils import SSLRetryMixin
 
 from .actions import Categorizer
 
 BLACKLISTED_BILL_IDS = {"128": ("SP 601", "SP 602"), "129": (), "130": ()}
 
 
-class MEBillScraper(Scraper):
+class MEBillScraper(SSLRetryMixin, Scraper):
     categorizer = Categorizer()
     _tz = pytz.timezone("US/Eastern")
 
@@ -27,9 +28,8 @@ class MEBillScraper(Scraper):
         for chamber in chambers:
             yield from self.scrape_chamber(chamber, session, first_item)
 
-    def scrape_chamber(self, chamber, session, first_item=1):
-        # Create a Bill for each Paper of the chamber's session
-        request_session = requests.Session()
+    def _start_search(self, request_session, chamber, session, **filters):
+        # the result pages belong to this search, held server side on the session
         search_url = "https://legislature.maine.gov/LawMakerWeb/doadvancedsearch.asp"
         session_number = str(int(session) - 116)
         paper_type = "HP" if chamber == "lower" else "SP"
@@ -46,17 +46,59 @@ class MEBillScraper(Scraper):
             "ActionChamber": "None",
             "GovernorAction": "None",
             "FinalLawType": "None",
+            **filters,
         }
-        r = request_session.post(url=search_url, data=form_data)
+        r = request_session.post(url=search_url, data=form_data, timeout=self.timeout)
         r.raise_for_status()
 
+    def scrape_chamber(self, chamber, session, first_item=1):
+        # Create a Bill for each Paper of the chamber's session
+        request_session = requests.Session()
+        self._start_search(request_session, chamber, session)
+
         self.seen = set()
+        self.rollcall_papers = self._papers_with_rollcalls(chamber, session)
         yield from self._recursively_process_bills(
             request_session=request_session,
             chamber=chamber,
             session=session,
             first_item=first_item,
         )
+
+    def _papers_with_rollcalls(self, chamber, session):
+        # most papers have no roll calls, and the docket doesn't name every one,
+        # so ask the search which papers have them; None means fetch them all
+        url = "https://legislature.maine.gov/LawMakerWeb/searchresults.asp"
+        ids = set()
+        for rollcall_chamber in ("H", "S"):
+            request_session = requests.Session()
+            self._start_search(
+                request_session,
+                chamber,
+                session,
+                RollcallChamber=rollcall_chamber,
+                RollcallFromDate="01/01/1990",
+                RollcallToDate="12/31/2100",
+            )
+            found, total, start = 0, None, 1
+            while True:
+                r = request_session.get(
+                    url, params={"StartWith": start}, timeout=self.timeout
+                )
+                r.raise_for_status()
+                doc = lxml.html.fromstring(r.text)
+                links = doc.xpath("//tr/td/b/a/@href")
+                if not links:
+                    break
+                total = re.search(r"\(of (\d+)\)", doc.text_content())
+                ids.update(link.split("ID=")[1] for link in links)
+                found += len(links)
+                start += 25
+            # result pages now and then come back empty, so trust only a full count
+            if not total or found != int(total.group(1)):
+                self.info(f"{rollcall_chamber} roll call search incomplete")
+                return None
+        return ids
 
     def _recursively_process_bills(
         self, request_session, chamber, session, first_item=1
@@ -70,10 +112,24 @@ class MEBillScraper(Scraper):
             f"Searching bills in {chamber} starting with item {first_item}"
         )
         url = "https://legislature.maine.gov/LawMakerWeb/searchresults.asp"
-        r = request_session.get(url, params={"StartWith": first_item})
-        r.raise_for_status()
-
-        bills = lxml.html.fromstring(r.text).xpath("//tr/td/b/a")
+        # a page of results occasionally comes back empty, or the connection
+        # drops, part way through a chamber: both end the scrape where it stands,
+        # so re-run the search and ask once more before believing either
+        bills = []
+        for attempt in range(2):
+            if attempt:
+                self._start_search(request_session, chamber, session)
+            try:
+                r = request_session.get(
+                    url, params={"StartWith": first_item}, timeout=self.timeout
+                )
+                r.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                self.warning(f"search results at item {first_item} failed: {e}")
+                continue
+            bills = lxml.html.fromstring(r.text).xpath("//tr/td/b/a")
+            if bills:
+                break
         if bills:
             for bill in bills:
                 bill_id_slug = bill.xpath("./@href")[0]
@@ -161,7 +217,7 @@ class MEBillScraper(Scraper):
         sponsors_page.make_links_absolute(sponsors_url)
 
         tr_text = sponsors_page.xpath("./body/table/td/table/tr/td//text()")
-        rgx = r"^\s*(Speaker|President|Senator|Representative) ([\w\s]+?)( of .+)\s*$"
+        rgx = r"^\s*(Speaker|President|Senator|Representative) (.+?)( of .+)\s*$"
 
         for text in tr_text:
             if "the Majority" in text:
@@ -249,9 +305,11 @@ class MEBillScraper(Scraper):
                     classification=["became-law"],
                 )
 
-        xpath = "//a[contains(@href, 'rollcalls.asp')]"
-        votes_link = page.xpath(xpath)[0]
-        yield from self.scrape_votes(bill, votes_link.attrib["href"])
+        paper_id = url.split("ID=")[1]
+        if self.rollcall_papers is None or paper_id in self.rollcall_papers:
+            xpath = "//a[contains(@href, 'rollcalls.asp')]"
+            votes_link = page.xpath(xpath)[0]
+            yield from self.scrape_votes(bill, votes_link.attrib["href"])
 
         spon_link = page.xpath("//a[contains(@href, 'subjects.asp')]")[0]
         spon_url = spon_link.get("href")
@@ -268,7 +326,9 @@ class MEBillScraper(Scraper):
         ver_url = ver_link.get("href")
 
         try:
-            ver_html = self.get(ver_url, retry_on_404=True).text
+            ver_html = self.get(
+                ver_url.replace("http://www.", "https://www.", 1), retry_on_404=True
+            ).text
         except (socket.timeout, requests.exceptions.HTTPError):
             pass
         else:
@@ -351,12 +411,19 @@ class MEBillScraper(Scraper):
         page.make_links_absolute(url)
 
         path = "//div/a[contains(@href, 'rollcall.asp')]"
+        seen_urls = set()
         for link in page.xpath(path):
             # skip blank motions, nothing we can do with these
             # seen on /LawMakerWeb/rollcalls.asp?ID=280039835
             if link.text:
                 motion = link.text.strip()
                 url = link.attrib["href"]
+
+                # some roll calls are listed twice on the same page
+                # seen on /LawMakerWeb/rollcalls.asp?ID=280097788
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
 
                 yield from self.scrape_vote(bill, motion, url)
 
@@ -393,7 +460,10 @@ class MEBillScraper(Scraper):
         outcome_cell = page.xpath("//td[text()='Outcome:']")[0]
         outcome = outcome_cell.xpath("string(following-sibling::td)")
 
+        # same-day roll calls can share motion and roll, so keep the RC number
+        serial = re.search(r"serialnumber=(\d+)", url).group(1)
         vote = VoteEvent(
+            identifier=f"{'S' if chamber == 'upper' else 'H'}-RC {serial}",
             chamber=chamber,
             start_date=date.strftime("%Y-%m-%d"),
             motion_text=motion,

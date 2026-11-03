@@ -1,23 +1,35 @@
+import os
 import re
 import pytz
 import datetime as dt
-from collections import defaultdict
+from collections import Counter, defaultdict
 from scrapelib import HTTPError
 import lxml.html
 import lxml.etree
 from openstates.scrape import Scraper, Bill, VoteEvent
+from openstates.utils import convert_pdf
 
 from utils import LXMLMixin
 
-from .utils import house_get_actor_from_action, senate_get_actor_from_action
+from .utils import (
+    ROLL_OPTIONS,
+    house_get_actor_from_action,
+    parse_journal_rolls,
+    senate_get_actor_from_action,
+    split_journal_pages,
+)
+from functools import lru_cache
 
 bill_types = {
     "HB ": "bill",
+    "HR ": "resolution",
     "HJR": "joint resolution",
     "HCR": "concurrent resolution",
     "SB ": "bill",
+    "SR ": "resolution",
     "SJR": "joint resolution",
     "SCR": "concurrent resolution",
+    "SRM": "resolution",
 }
 
 TIMEZONE = pytz.timezone("America/Chicago")
@@ -36,12 +48,24 @@ class MOBillScraper(Scraper, LXMLMixin):
     _subjects = defaultdict(list)
     _session_id = ""
 
+    @lru_cache(maxsize=512)
+    def normalize_sponsor_name(self, name: str) -> str:
+        # Strip whitespace and newlines
+        name = name.strip()
+        # Strip district number e.g. '(16)'
+        name = re.sub(r"\s*\(\d+\)", "", name)
+        # Convert 'Last, First' -> 'First Last'
+        if "," in name:
+            parts = name.split(",", 1)
+            name = f"{parts[1].strip()} {parts[0].strip()}"
+        return name.strip()
+
     def custom_header_func(self, url):
         return {"user-agent": "openstates.org"}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        super(Scraper, self).__init__(header_func=self.custom_header_func)
+        self._header_func = self.custom_header_func
 
     def _get_action(self, actor, action):
         # Alright. This covers both chambers and everything else.
@@ -131,7 +155,7 @@ class MOBillScraper(Scraper, LXMLMixin):
     def _scrape_senate_subjects(self, session: str):
         self.info("Collecting subject tags from upper chamber")
 
-        subject_list_url = f"https://www.senate.mo.gov/BillTracking/bills/keywords?year={session}&session={self.session_type(session)}"
+        subject_list_url = f"https://www.senate.mo.gov/BillTracking/bills/keywords?year={session[:4]}&session={self.session_type(session)}"
         page = self.lxmlize(subject_list_url)
 
         for row in page.xpath(
@@ -184,16 +208,9 @@ class MOBillScraper(Scraper, LXMLMixin):
             '//div[contains(@class, "detail-grid__item") and contains(string(.), "LR Number")]/div[1]'
         )[0].text_content()
 
-        bill_type = "bill"
-        triplet = bill_id_and_meta_string[:3]
-        if triplet in bill_types:
-            bill_type = bill_types[triplet]
-
-        subs = []
+        bill_type = bill_types.get(bill_identifier[:3], "bill")
+        subs = self._subjects.get(bill_identifier, [])
         bid = bill_id_and_meta_string.replace(" ", "")
-
-        if bid in self._subjects:
-            subs = self._subjects[bid]
 
         if bid == "XXXXXX":
             self.warning(f"Skipping Junk Bill {bid}")
@@ -219,6 +236,7 @@ class MOBillScraper(Scraper, LXMLMixin):
             '//div[contains(@class, "detail-grid__item") and contains(string(.), "Sponsor")]/div[1]'
         )[0].text_content()
 
+        bill_sponsor = self.normalize_sponsor_name(bill_sponsor)
         if "Senators" in bill_sponsor_link:
             chamber = "upper"
         else:
@@ -242,6 +260,7 @@ class MOBillScraper(Scraper, LXMLMixin):
         if co_sponsors_elements:
             for element in co_sponsors_elements:
                 name = element.text_content()
+                name = self.normalize_sponsor_name(name)
                 bill.add_sponsorship(
                     name,
                     entity_type="person",
@@ -317,12 +336,16 @@ class MOBillScraper(Scraper, LXMLMixin):
         page = lxml.html.fromstring(page.content)
         for link in page.cssselect("div.link-card-stack a"):
             link_url = link.xpath("@href")[0]
-            link_text = link.text_content().strip()
+            link_text = " ".join(link.text_content().split())
 
             if "adopted" in link_text.lower():
                 bill.add_version_link(
                     link_text,
                     link_url,
+                    # "SA 1 to SS for SCS S offered" is an amendment; "SS ..." substitutes are full text
+                    classification=(
+                        "amendment" if re.search(r"\bSA \d", link_text) else ""
+                    ),
                     media_type="application/pdf",
                     on_duplicate="ignore",
                 )
@@ -337,7 +360,7 @@ class MOBillScraper(Scraper, LXMLMixin):
     def _scrape_upper_chamber(self, session):
         self.info("Scraping bills from upper chamber.")
 
-        index_url = f"https://www.senate.mo.gov/BillTracking/Bills/BillList?year={session}&session={self.session_type(session)}"
+        index_url = f"https://www.senate.mo.gov/BillTracking/Bills/BillList?year={session[:4]}&session={self.session_type(session)}"
 
         index_page = self.get(index_url).text
         index_page = lxml.html.fromstring(index_page)
@@ -495,6 +518,7 @@ class MOBillScraper(Scraper, LXMLMixin):
         bill_actions = response.xpath("//BillInformation/Action")
         old_action_url = ""
         votes = []
+        used_rolls = []
 
         for action in bill_actions:
             action_url = (
@@ -532,14 +556,26 @@ class MOBillScraper(Scraper, LXMLMixin):
                     rc_present = ""
                 action_title = f"{action_title} - AYES: {rc_yes} NOES: {rc_no} PRESENT: {rc_present}"
 
+                # the action text doesn't always say which chamber voted,
+                # e.g. "Truly Agreed To and Finally Passed" on a Senate roll call
+                if action.xpath("./SenateJournalStartPage"):
+                    vote_chamber = "upper"
+                elif action.xpath("./HouseJournalStartPage"):
+                    vote_chamber = "lower"
+                else:
+                    vote_chamber = actor
                 vote = VoteEvent(
-                    chamber=actor,
+                    chamber=vote_chamber,
                     motion_text=action_title,
-                    result="pass" if rc_yes > rc_no else "fail",
+                    result="pass" if int(rc_yes or 0) > int(rc_no or 0) else "fail",
                     classification="passage",
                     start_date=TIMEZONE.localize(action_date),
                     bill=bill,
                 )
+                vote.set_count("yes", int(rc_yes or 0))
+                vote.set_count("no", int(rc_no or 0))
+                vote.set_count("other", int(rc_present or 0))
+                self._add_journal_roll(vote, action, bill, used_rolls)
 
                 vote.add_source(action_url)
                 votes.append(vote)
@@ -583,6 +619,115 @@ class MOBillScraper(Scraper, LXMLMixin):
             #         on_duplicate="ignore",
             #     )
         return votes
+
+    @lru_cache(maxsize=None)
+    def _journal_rolls(self, url):
+        try:
+            filename, _ = self.urlretrieve(url)
+        except HTTPError:
+            self.warning(f"Could not fetch journal {url}")
+            return [], None
+        text = convert_pdf(filename, "text").decode("utf-8", "replace")
+        os.remove(filename)
+        # House rolls list the Speaker as "Mr. Speaker"
+        speaker = re.search(
+            r"\bSpeaker ([A-Z][a-z]+) (?:in the Chair|resumed the Chair)", text
+        )
+        return parse_journal_rolls(split_journal_pages(text)), (
+            speaker.group(1) if speaker else None
+        )
+
+    @lru_cache(maxsize=None)
+    def _senate_journals(self, year):
+        url = f"https://www.senate.mo.gov/journallist/?SelectedYear={year}"
+        # e.g. /26info/Journals/RDay6205061522-1559.pdf: day 62, May 6, pages 1522-1559.
+        # R is the regular session, V the veto session, T1/T2 extraordinary sessions.
+        # A few files are named "Rday" instead.
+        return [
+            (prefix, mmdd, int(start), int(end), f"https://www.senate.mo.gov{path}")
+            for path, prefix, mmdd, start, end in set(
+                re.findall(
+                    r"(/\d\dinfo/Journals/([A-Z]\d?)[Dd]ay\d\d(\d{4})(\d+)-(\d+)\.pdf)",
+                    self.get(url).text,
+                )
+            )
+        ]
+
+    def _senate_journal_url(self, page, date):
+        session = self._session_id
+        prefixes = ("R", "V") if len(session) == 4 else (f"T{session[-1]}",)
+        candidates = [
+            (mmdd, url)
+            for prefix, mmdd, start, end, url in self._senate_journals(session[:4])
+            if prefix in prefixes and start <= page <= end
+        ]
+        if not candidates:
+            return None
+        # veto session pages restart at 1, so take the journal closest to the action date
+        day = int(date[5:7] + date[8:10])
+        return min(candidates, key=lambda c: abs(int(c[0]) - day))[1]
+
+    def _add_journal_roll(self, vote, action, bill, used_rolls):
+        """Add voter names from the House or Senate journal roll call this action cites."""
+        senate = action.xpath("./SenateJournalStartPage/text()")
+        house = action.xpath("./HouseJournalStartPage/text()")
+        date = action.xpath("./PubDate/text()")[0]
+        if senate:
+            start = int(senate[0])
+            end = int((action.xpath("./SenateJournalEndPage/text()") or senate)[0])
+            url = self._senate_journal_url(start, date)
+        elif house:
+            start = int(house[0])
+            end = int((action.xpath("./HouseJournalEndPage/text()") or house)[0])
+            url = (action.xpath("./JournalLink/text()") or [""])[0].split("#")[0]
+        else:
+            self._roll_stats["no journal page"] += 1
+            return
+        if not url or not url.endswith(".pdf"):
+            self._roll_stats["no journal"] += 1
+            return
+
+        rolls, speaker = self._journal_rolls(url)
+        counts = {c["option"]: c["value"] for c in vote.counts}
+        # combined bills are cited as e.g. "HCS HBs 1663, 1607 & 1973"
+        prefix, number = bill.identifier.split()
+        bill_re = re.compile(rf"\b{prefix}s?\s+(?:\d+\s*(?:,|&|and)\s*)*{number}\b")
+        status = "no roll in journal"
+        for roll in rolls:
+            if (
+                id(roll) in used_rolls
+                or not start <= (roll["page"] or 0) <= end + 1
+                or not bill_re.search(roll["context"])
+            ):
+                continue
+            yes = roll["counts"].get("ayes", roll["counts"].get("yeas"))
+            no = roll["counts"].get("noes", roll["counts"].get("nays"))
+            if (yes, no, roll["counts"].get("present", 0)) != (
+                counts["yes"],
+                counts["no"],
+                counts["other"],
+            ):
+                status = "counts differ from journal"
+                continue
+            used_rolls.append(id(roll))
+            if not roll["complete"]:
+                status = "journal names don't match its counts"
+                break
+            for key, count in roll["counts"].items():
+                if ROLL_OPTIONS[key] in ("absent", "excused", "abstain"):
+                    vote.set_count(ROLL_OPTIONS[key], count)
+            for option, name in roll["votes"]:
+                if name == "Mr. Speaker" and speaker:
+                    name = speaker
+                vote.vote(option, name)
+            vote.add_source(url)
+            status = "full roll"
+            break
+        self._roll_stats[status] += 1
+        if status != "full roll":
+            self.info(
+                f"{bill.identifier} {vote.motion_text}: {status} ({url} p. {start})"
+            )
 
     # Get the house bill versions
     def parse_house_bill_versions(self, response, bill):
@@ -639,7 +784,11 @@ class MOBillScraper(Scraper, LXMLMixin):
             else:
                 mimetype = "text/html"
             bill.add_version_link(
-                summary_name, path, media_type=mimetype, on_duplicate="ignore"
+                summary_name,
+                path,
+                classification="amendment",
+                media_type=mimetype,
+                on_duplicate="ignore",
             )
 
         # house fiscal notes
@@ -684,12 +833,15 @@ class MOBillScraper(Scraper, LXMLMixin):
         # special sessions and other year manipulation messes up the session variable
         # but we need it for correct output
         self._session_id = session
+        self._roll_stats = Counter()
 
         if chamber in ["upper", None]:
             self._scrape_senate_subjects(session)
             yield from self._scrape_upper_chamber(session)
         if chamber in ["lower", None]:
             yield from self._scrape_lower_chamber(session)
+
+        self.info(f"Journal roll calls: {dict(self._roll_stats)}")
 
         if len(self._bad_urls) > 0:
             self.warning("WARNINGS:")

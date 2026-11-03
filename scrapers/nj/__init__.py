@@ -1,12 +1,9 @@
-import requests
+import scrapelib
 from openstates.scrape import State
 from .bills import NJBillScraper
 from .events import NJEventScraper
 from .bills_web import NJBillScraper as NJBillWebScraper
 from .events_web import NJEventScraper as NJEventWebScraper
-
-# don't retry- if a file isn't on FTP just let it go
-settings = dict(SCRAPELIB_RETRY_ATTEMPTS=0)
 
 
 class NewJersey(State):
@@ -104,7 +101,7 @@ class NewJersey(State):
     def get_session_list(self):
         return [
             s["display"]
-            for s in requests.get(
-                "https://www.njleg.state.nj.us/api/downloads/sessions", verify=False
-            ).json()
+            for s in scrapelib.Scraper(retry_attempts=3)
+            .get("https://www.njleg.state.nj.us/api/downloads/sessions", timeout=60)
+            .json()
         ]

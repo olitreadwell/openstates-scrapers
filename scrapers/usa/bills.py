@@ -58,6 +58,7 @@ class USBillScraper(Scraper):
         "Cloture on the Motion to Proceed Rejected": "fail",
         "Cloture on the Motion to Proceed Agreed to": "pass",
         "Concurrent Resolution Agreed to": "pass",
+        "Concurrent Resolution Rejected": "fail",
         "Conference Report Agreed to": "pass",
         "Amendment Rejected": "fail",
         "Decision of Chair Sustained": "pass",
@@ -99,7 +100,7 @@ class USBillScraper(Scraper):
     # to scrape everything UPDATED after a given date/time, start="2020-01-01 22:01:01"
     def scrape(self, chamber=None, session=None, start=None, hearings=True):
         if start:
-            start = datetime.datetime.strptime(start, "%Y-%m-%d %H:%I:%S")
+            start = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
         else:
             start = datetime.datetime(1980, 1, 1, 0, 0, 1)
 
@@ -447,20 +448,31 @@ class USBillScraper(Scraper):
             )
 
         # ex: https://rules.house.gov/bill/116/hr-3884
-        if chamber == "lower":
-            rules_url = (
-                f"https://rules.house.gov/bill/{session}/{bill_id.replace(' ', '-')}"
+        # Most House measures have no Rules page and 404. Those that do are on a
+        # House/Union Calendar or have a Rules Committee action.
+        rules_hint = re.compile(
+            r"Rules Committee|Committee on Rules|rule H\. ?Res|"
+            r"Placed on the (Union|House) Calendar",
+            re.I,
+        )
+        if chamber == "lower" and (
+            any(rules_hint.search(t.text or "") for t in xml.iter("text"))
+            or any(c.text == "hsru00" for c in xml.iter("systemCode"))
+        ):
+            # the site's slugs are hr-, h-res-, hj-res- and h-con-res-
+            bill_type, bill_num = bill_id.split()
+            slug = {"HRES": "h-res", "HJRES": "hj-res", "HCONRES": "h-con-res"}.get(
+                bill_type, bill_type.lower()
             )
-            # FYI: this request may be inefficient, because many bills do not have a page at the generated URL
-            # so we may be making a lot of requests that just go to 404
-            # additionally, the server occasionally returns 403, and that triggers a backoff/retry which wastes minutes
+            rules_url = f"https://rules.house.gov/bill/{session}/{slug}-{bill_num}"
+            # the server occasionally returns 403, and that triggers a backoff/retry which wastes minutes
             # accordingly, we use requests directly and avoid retries
             try:
-                page = lxml.html.fromstring(requests.get(rules_url).content)
+                page = lxml.html.fromstring(
+                    requests.get(rules_url, timeout=self.timeout).content
+                )
                 page.make_links_absolute(rules_url)
-                for row in page.xpath(
-                    '//article[contains(@class, "field-name-field-amendment-table")]/div/div/table/tr'
-                ):
+                for row in page.xpath('//article[@id="amendments"]//tbody/tr'):
                     if row.xpath("td[3]/a"):
                         amdt_num = row.xpath("td[1]/text()")[0].strip()
                         amdt_sponsor = row.xpath("td[3]/a/text()")[0].strip()
@@ -477,8 +489,8 @@ class USBillScraper(Scraper):
             except (requests.exceptions.HTTPError, lxml.etree.XMLSyntaxError):
                 # Not every bill has a rules committee page
                 return
-            except requests.exceptions.ProxyError:
-                self.warning(f"ProxyError exception was swallowed for {rules_url}")
+            except requests.exceptions.RequestException as e:
+                self.warning(f"Skipping {rules_url}: {e}")
                 return
 
     # CBO cost estimates
@@ -658,14 +670,16 @@ class USBillScraper(Scraper):
                         "https": os.environ.get("HTTPS_PROXY_SELECTIVE"),
                         "http": os.environ.get("HTTP_PROXY_SELECTIVE"),
                     }
-                    content = requests.get(url, proxies=proxies, verify=False).content
+                    content = requests.get(
+                        url, proxies=proxies, verify=False, timeout=self.timeout
+                    ).content
                 else:
-                    content = requests.get(url).content
+                    content = requests.get(url, timeout=self.timeout).content
 
                 if "You don't have permission to access" in content.decode():
                     # sometimes clerk.house.gov serves an error page, but doesn't send a 403 header
                     self.info(f"Error fetching {url}, skipping")
-                    return
+                    continue
                 vote_xml = lxml.html.fromstring(content)
                 if chamber.lower() == "senate":
                     vote = self.scrape_senate_votes(vote_xml, url)
@@ -674,7 +688,10 @@ class USBillScraper(Scraper):
                 yield vote
             except (requests.exceptions.HTTPError, lxml.etree.XMLSyntaxError):
                 self.info(f"Error fetching {url}, skipping (used requests, no retries)")
-                return
+                continue
+            except requests.exceptions.Timeout:
+                self.warning(f"Timed out fetching {url}, skipping")
+                continue
             except Exception as e:
                 self.warning(f"Error parsing vote at {url}: {e}")
                 if vote_xml:
@@ -691,7 +708,7 @@ class USBillScraper(Scraper):
         vote_date = page.xpath("//roll_call_vote/vote_date/text()")[0].strip()
 
         when = self._TZ.localize(
-            datetime.datetime.strptime(vote_date, "%B %d, %Y, %H:%M %p")
+            datetime.datetime.strptime(vote_date, "%B %d, %Y, %I:%M %p")
         )
 
         session = page.xpath("//roll_call_vote/congress/text()")[0]
@@ -792,7 +809,7 @@ class USBillScraper(Scraper):
 
         bill_id = page.xpath("//rollcall-vote/vote-metadata/legis-num/text()")[0]
         # for some reason these are "H R 123" which nobody uses, so fix to "HR 123"
-        bill_id = re.sub(r"([A-Z])\s([A-Z])", r"\1\2", bill_id)
+        bill_id = re.sub(r"(?<=[A-Z])\s+(?=[A-Z])", "", bill_id)
 
         roll_call = page.xpath("//rollcall-vote/vote-metadata/rollcall-num/text()")[0]
 

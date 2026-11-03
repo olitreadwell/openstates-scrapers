@@ -114,6 +114,7 @@ class NCBillScraper(Scraper):
             bill.add_version_link(
                 version_name,
                 version_url,
+                classification="amendment",
                 media_type="application/pdf",
                 on_duplicate="ignore",
             )
@@ -233,7 +234,7 @@ class NCBillScraper(Scraper):
                 chamber = "upper"
 
             date = eastern.localize(
-                dt.datetime.strptime(date.replace(".", ""), "%m/%d/%Y %H:%M %p")
+                dt.datetime.strptime(date.replace(".", ""), "%m/%d/%Y %I:%M %p")
             )
             date = date.isoformat()
 
@@ -245,7 +246,7 @@ class NCBillScraper(Scraper):
                 bill=bill,
                 classification="passage",  # TODO: classify votes
             )
-            ve.dedupe_key = rcs
+            ve.dedupe_key = result_link
             ve.set_count("yes", int(aye))
             ve.set_count("no", int(no))
             ve.set_count("not voting", int(nv))
@@ -280,7 +281,11 @@ class NCBillScraper(Scraper):
                 elif "Not Voting (" in row:
                     row = row.replace("\n", ";")
                     votes_names = row.replace(" ", "").strip().split(";")[2:-1]
-                    vote_type = "abstain"
+                    vote_type = "not voting"
+                elif "Excused Vote (" in row:
+                    row = row.replace("\n", ";")
+                    votes_names = row.replace(" ", "").strip().split(";")[2:-1]
+                    vote_type = "excused"
                 else:
                     vote_type = "Not a vote"
                 if votes_names:
@@ -426,7 +431,7 @@ class NCBillScraper(Scraper):
                             elif vote_location == noVt_location:
                                 how_voted = "other"
                             elif vote_location == exAb_location:
-                                how_voted == "absent"
+                                how_voted = "absent"
                             else:
                                 how_voted = "excused"
 

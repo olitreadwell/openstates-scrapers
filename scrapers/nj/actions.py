@@ -10,9 +10,13 @@ _categorizer_rules = (
     Rule(r"Reported out of (Senate|Assembly) Committee", "committee-passage"),
     Rule(r"Assembly Floor Amendment Passed", "amendment-passage"),
     Rule(r"Senate Amendment", "amendment-passage"),
-    Rule(r"Passed (Senate|Assembly)", "passage"),
-    Rule(r"^Approved$", "executive-signature"),
-    Rule(r"Approved with Line Item Veto", "executive-veto-line-item"),
+    Rule(r"Passed( by the)? (Senate|Assembly)", "passage"),
+    # the web API appends the chapter law, e.g. "Approved P.L.2026, c.3."
+    Rule(r"^Approved($| P\.L\.)", "executive-signature"),
+    Rule(
+        r"Approved with Line Item Veto",
+        ["executive-signature", "executive-veto-line-item"],
+    ),
     Rule(r"(Absolute|Conditional) Veto", "executive-veto"),
     Rule(
         r"(Introduced|Received) in the (Assembly|Senate), Referred to",

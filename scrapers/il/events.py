@@ -1,5 +1,6 @@
 import datetime as dt
 import lxml
+import os
 import re
 
 from openstates.scrape import Scraper, Event
@@ -28,8 +29,12 @@ committee_name_re = re.compile(r"(.*) Hearing Details", flags=re.IGNORECASE)
 class IlEventScraper(Scraper):
     localize = pytz.timezone("America/Chicago").localize
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.user_agent = os.getenv("USER_AGENT", "openstates")
+
     def scrape_page(self, url, chamber):
-        html = self.get(url).text
+        html = self.get(url, verify=False).text
         doc = lxml.html.fromstring(html)
         doc.make_links_absolute(url)
 
@@ -109,7 +114,7 @@ class IlEventScraper(Scraper):
                 url = urls[chamber]
             except KeyError:
                 return  # Not for us.
-            html = self.get(url).text
+            html = self.get(url, verify=False).text
             doc = lxml.html.fromstring(html)
             doc.make_links_absolute(url)
 
