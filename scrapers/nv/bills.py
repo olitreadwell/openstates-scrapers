@@ -1,7 +1,6 @@
 import re
 import pytz
 import logging
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 import dateutil.parser
@@ -193,7 +192,6 @@ class BillList(Utf8HtmlMixin, HtmlListPage):
         return (
             f"https://www.leg.state.nv.us/App/NELIS/REL/{slug}/"
             "HomeBill/BillsTab?selectedTab=List&Filters.PageSize=2147483647"
-            f"&_={time.time()}"
         )
 
     def process_item(self, item):
@@ -230,7 +228,6 @@ class BillTabDetail(Utf8HtmlMixin, HtmlPage):
         url = (
             f"https://www.leg.state.nv.us/App/NELIS/REL/{slug}/Bill/"
             f"FillSelectedBillTab?selectedTab=Overview&billKey={bill_key}"
-            f"&_={time.time()}"
         )
         return url
 
@@ -326,7 +323,7 @@ class BillTabDetail(Utf8HtmlMixin, HtmlPage):
         if not action_type:
             action_type = None
         else:
-            action_type = list(set(action_type))
+            action_type = sorted(set(action_type))
 
         act = bill.add_action(
             description=action,
